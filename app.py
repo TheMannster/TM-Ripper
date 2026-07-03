@@ -68,7 +68,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -363,8 +363,58 @@ def mk_card(parent):
                     highlightbackground=BORDER_LEGACY, highlightthickness=1)
 
 
+def show_dark_menu(root, x, y, entries):
+    """A borderless dark popup menu (no white native-menu border).
+
+    entries: list of ("sep",) | ("cmd", label, callback) |
+             ("check", label, callback, is_checked)
+    """
+    win = tk.Toplevel(root)
+    win.overrideredirect(True)
+    try:
+        win.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    border = tk.Frame(win, bg=BORDER_LEGACY)
+    border.pack(fill="both", expand=True)
+    body = tk.Frame(border, bg=SURFACE_LEGACY)
+    body.pack(fill="both", expand=True, padx=1, pady=1)
+
+    def close(_=None):
+        if win.winfo_exists():
+            win.destroy()
+
+    has_check = any(e[0] == "check" for e in entries)
+    for e in entries:
+        if e[0] == "sep":
+            tk.Frame(body, bg=BORDER_LEGACY, height=1).pack(fill="x", padx=8, pady=4)
+            continue
+        label, cb = e[1], e[2]
+        if e[0] == "check":
+            label = ("\u2713   " if len(e) > 3 and e[3] else "     ") + label
+        elif has_check:
+            label = "     " + label
+        row = tk.Label(body, text=label, bg=SURFACE_LEGACY, fg=TEXT_LEGACY, font=UI_FONT,
+                       anchor="w", padx=16, pady=7, cursor="hand2")
+        row.pack(fill="x")
+        row.bind("<Enter>", lambda _e, w=row: w.config(bg=PRIMARY, fg=PRIMARY_TEXT))
+        row.bind("<Leave>", lambda _e, w=row: w.config(bg=SURFACE_LEGACY, fg=TEXT_LEGACY))
+        row.bind("<Button-1>", lambda _e, c=cb: (close(), c()))
+
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = min(x, sw - win.winfo_reqwidth() - 4)
+    y = min(y, sh - win.winfo_reqheight() - 4)
+    win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    win.bind("<Escape>", close)
+    win.focus_force()
+    win.after(60, lambda: win.winfo_exists() and win.bind("<FocusOut>", close))
+    return win
+
+
 def mk_dropdown(parent, var, values, width=20):
-    """Flat modern dropdown: styled like an input with a chevron + themed menu."""
+    """Flat modern dropdown: styled like an input with a chevron + dark menu."""
     wrap = tk.Frame(parent, bg=BORDER_LEGACY, bd=0, highlightthickness=0)
     inner = tk.Frame(wrap, bg=INPUT_LEGACY, cursor="hand2")
     inner.pack(fill="both", expand=True, padx=1, pady=1)
@@ -375,17 +425,10 @@ def mk_dropdown(parent, var, values, width=20):
                        font=("Segoe UI", 9), cursor="hand2")
     chevron.pack(side="right", padx=(0, 10))
 
-    menu = tk.Menu(inner, tearoff=0, bg=INPUT_LEGACY, fg=TEXT_LEGACY, bd=0, relief="flat",
-                   activebackground=PRIMARY, activeforeground=PRIMARY_TEXT,
-                   font=UI_FONT, activeborderwidth=0)
-    for v in values:
-        menu.add_command(label=v, command=lambda vv=v: var.set(vv))
-
     def popup(_e=None):
-        try:
-            menu.tk_popup(wrap.winfo_rootx(), wrap.winfo_rooty() + wrap.winfo_height() + 2)
-        finally:
-            menu.grab_release()
+        entries = [("check", v, lambda vv=v: var.set(vv), v == var.get()) for v in values]
+        show_dark_menu(wrap.winfo_toplevel(),
+                       wrap.winfo_rootx(), wrap.winfo_rooty() + wrap.winfo_height() + 2, entries)
 
     def on_enter(_):
         wrap.config(bg=SUBTEXT_LEGACY)
@@ -645,18 +688,27 @@ class DownloaderApp:
             menubar.add_cascade(label=title, menu=sub)
         self.root.config(menu=menubar)
 
+    def _spec_to_entries(self, items):
+        entries = []
+        for it in items:
+            if it[0] == "sep":
+                entries.append(("sep",))
+            elif it[0] == "command":
+                entries.append(("cmd", it[1], it[2]))
+            elif it[0] == "radio":
+                entries.append(("check", it[1],
+                                (lambda v=it[2]: self._apply_theme(v)), it[2] == self.theme))
+        return entries
+
     def _build_menubar_legacy(self, parent):
         """Custom dark menu bar so it matches the modern theme."""
         bar = tk.Frame(parent, bg=BG_LEGACY)
         for title, items in self._menu_spec():
-            menu = tk.Menu(bar, tearoff=0, bg=SURFACE_LEGACY, fg=TEXT_LEGACY, bd=0,
-                           relief="flat", activebackground=PRIMARY, activeforeground=PRIMARY_TEXT,
-                           activeborderwidth=0, font=UI_FONT, selectcolor=PRIMARY)
-            self._populate_menu(menu, items)
             btn = tk.Label(bar, text=title, bg=BG_LEGACY, fg=TEXT_LEGACY, font=UI_FONT,
                            padx=12, pady=7, cursor="hand2")
-            btn.bind("<Button-1>",
-                     lambda _e, m=menu, b=btn: m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height()))
+            btn.bind("<Button-1>", lambda _e, it=items, b=btn: show_dark_menu(
+                self.root, b.winfo_rootx(), b.winfo_rooty() + b.winfo_height(),
+                self._spec_to_entries(it)))
             btn.bind("<Enter>", lambda _e, b=btn: b.config(bg=BTN_LEGACY))
             btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=BG_LEGACY))
             btn.pack(side="left")
