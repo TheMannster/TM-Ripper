@@ -24,11 +24,17 @@ import json
 import time
 import queue
 import tempfile
+import shutil
 import threading
 import subprocess
 import urllib.request
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
+
+try:
+    import winsound  # Windows-only; used for our own notification sounds
+except Exception:  # pragma: no cover
+    winsound = None
 
 try:
     import yt_dlp
@@ -62,7 +68,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -92,6 +98,8 @@ except OSError:
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 ICON_ICO = os.path.join(BUNDLE_DIR, "assets", "icon.ico")
 ICON_PNG = os.path.join(BUNDLE_DIR, "assets", "icon.png")
+SOUND_NOTIFY = os.path.join(BUNDLE_DIR, "assets", "notify.wav")
+SOUND_ERROR = os.path.join(BUNDLE_DIR, "assets", "error.wav")
 
 
 def find_ffmpeg_dir():
@@ -226,6 +234,25 @@ def first_url(text: str) -> str:
     return match.group(0) if match else (text or "").strip()
 
 
+def set_dark_titlebar(window, dark: bool):
+    """Toggle the native Windows title bar between dark and light."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (new, then legacy)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
+            ) == 0:
+                break
+    except Exception:
+        pass
+
+
 # ----------------------------------------------------------- Win95 helpers
 def make_button(parent, text, command, bold=False, width=None):
     return tk.Button(
@@ -336,6 +363,45 @@ def mk_card(parent):
                     highlightbackground=BORDER_LEGACY, highlightthickness=1)
 
 
+def mk_dropdown(parent, var, values, width=20):
+    """Flat modern dropdown: styled like an input with a chevron + themed menu."""
+    wrap = tk.Frame(parent, bg=BORDER_LEGACY, bd=0, highlightthickness=0)
+    inner = tk.Frame(wrap, bg=INPUT_LEGACY, cursor="hand2")
+    inner.pack(fill="both", expand=True, padx=1, pady=1)
+    value = tk.Label(inner, textvariable=var, bg=INPUT_LEGACY, fg=TEXT_LEGACY, font=UI_FONT,
+                     anchor="w", width=width, cursor="hand2")
+    value.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=6)
+    chevron = tk.Label(inner, text="\u25be", bg=INPUT_LEGACY, fg=SUBTEXT_LEGACY,
+                       font=("Segoe UI", 9), cursor="hand2")
+    chevron.pack(side="right", padx=(0, 10))
+
+    menu = tk.Menu(inner, tearoff=0, bg=INPUT_LEGACY, fg=TEXT_LEGACY, bd=0, relief="flat",
+                   activebackground=PRIMARY, activeforeground=PRIMARY_TEXT,
+                   font=UI_FONT, activeborderwidth=0)
+    for v in values:
+        menu.add_command(label=v, command=lambda vv=v: var.set(vv))
+
+    def popup(_e=None):
+        try:
+            menu.tk_popup(wrap.winfo_rootx(), wrap.winfo_rooty() + wrap.winfo_height() + 2)
+        finally:
+            menu.grab_release()
+
+    def on_enter(_):
+        wrap.config(bg=SUBTEXT_LEGACY)
+        chevron.config(fg=TEXT_LEGACY)
+
+    def on_leave(_):
+        wrap.config(bg=BORDER_LEGACY)
+        chevron.config(fg=SUBTEXT_LEGACY)
+
+    for w in (inner, value, chevron):
+        w.bind("<Button-1>", popup)
+        w.bind("<Enter>", on_enter)
+        w.bind("<Leave>", on_leave)
+    return wrap
+
+
 def mk_caption(parent, text, bg):
     return tk.Label(parent, text=text.upper(), bg=bg, fg=SUBTEXT_LEGACY,
                     font=UI_LABEL, anchor="w")
@@ -430,9 +496,10 @@ class DownloaderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("720x940")
-        self.root.minsize(560, 600)
+        self.root.geometry("520x900")
+        self.root.minsize(460, 560)
         self._legacy_logo_ref = None
+        self._toasts = []
         self._apply_window_icon()
 
         self.msg_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -456,10 +523,12 @@ class DownloaderApp:
         self.folder_var = tk.StringVar(value=saved_folder)
         self.quality_var = tk.StringVar(value=settings.get("quality", "Best video + audio"))
         self.status_var = tk.StringVar(value="Ready.")
+        self.sound_var = tk.BooleanVar(value=bool(settings.get("sound", True)))
         self.url_var.trace_add("write", self._on_url_change)
-        # Persist folder/quality the moment they change so settings never get lost.
+        # Persist folder/quality/sound the moment they change so settings never get lost.
         self.folder_var.trace_add("write", lambda *_: self._persist())
         self.quality_var.trace_add("write", lambda *_: self._persist())
+        self.sound_var.trace_add("write", lambda *_: self._persist())
 
         self.log_history: list[tuple[str, bool]] = []
         self._update_checked = False
@@ -497,9 +566,12 @@ class DownloaderApp:
 
     # -------------------------------------------------------- Theme control
     def _persist(self):
-        save_settings(
-            {"theme": self.theme, "folder": self.folder_var.get(), "quality": self.quality_var.get()}
-        )
+        save_settings({
+            "theme": self.theme,
+            "folder": self.folder_var.get(),
+            "quality": self.quality_var.get(),
+            "sound": bool(self.sound_var.get()),
+        })
 
     def _apply_theme(self, theme: str):
         if theme not in (THEME_RETRO, THEME_LEGACY) or theme == self.theme:
@@ -517,58 +589,240 @@ class DownloaderApp:
         self._build_all()
 
     def _build_all(self):
-        self._build_menu()
         if self.theme == THEME_RETRO:
+            self._build_menu()
             self.root.configure(bg=FACE)
             self._build_retro_ui()
         else:
+            # Hide the native (light) menu bar; we draw our own dark one instead.
+            self.root.config(menu=tk.Menu(self.root))
             self.root.configure(bg=BG_LEGACY)
             self._build_legacy_ui()
+        set_dark_titlebar(self.root, self.theme == THEME_LEGACY)
         self._restore_log()
         self._on_url_change()
         self._register_dnd()
         self._update_action_buttons()
 
     # ------------------------------------------------------------ Menu bar
+    def _menu_spec(self):
+        return [
+            ("File", [
+                ("command", "Open save folder", self._open_folder),
+                ("sep",),
+                ("command", "Exit", self._on_close),
+            ]),
+            ("Settings", [
+                ("command", "Preferences\u2026", self._open_settings),
+                ("sep",),
+                ("radio", "Legacy (Modern) look", THEME_LEGACY),
+                ("radio", "Retro (Windows 95) look", THEME_RETRO),
+            ]),
+            ("Tools", [
+                ("command", "Check for updates\u2026", lambda: self._check_app_updates(manual=True)),
+                ("command", "Update video engine (yt-dlp)", self._update_downloader),
+            ]),
+            ("Help", [
+                ("command", "About\u2026", self._about),
+            ]),
+        ]
+
+    def _populate_menu(self, menu, items):
+        for it in items:
+            if it[0] == "sep":
+                menu.add_separator()
+            elif it[0] == "command":
+                menu.add_command(label=it[1], command=it[2])
+            elif it[0] == "radio":
+                menu.add_radiobutton(label=it[1], variable=self.theme_var, value=it[2],
+                                     command=lambda v=it[2]: self._apply_theme(v))
+
     def _build_menu(self):
         menubar = tk.Menu(self.root, tearoff=0)
-
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Open save folder", command=self._open_folder)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.destroy)
-        menubar.add_cascade(label="File", menu=file_menu)
-
-        settings_menu = tk.Menu(menubar, tearoff=0)
-        settings_menu.add_command(label="Preferences...", command=self._open_settings)
-        settings_menu.add_separator()
-        settings_menu.add_radiobutton(
-            label="Legacy (Modern) look", variable=self.theme_var, value=THEME_LEGACY,
-            command=lambda: self._apply_theme(THEME_LEGACY),
-        )
-        settings_menu.add_radiobutton(
-            label="Retro (Windows 95) look", variable=self.theme_var, value=THEME_RETRO,
-            command=lambda: self._apply_theme(THEME_RETRO),
-        )
-        menubar.add_cascade(label="Settings", menu=settings_menu)
-
-        tools_menu = tk.Menu(menubar, tearoff=0)
-        tools_menu.add_command(label="Check for updates...", command=lambda: self._check_app_updates(manual=True))
-        tools_menu.add_command(label="Update video engine (yt-dlp)", command=self._update_downloader)
-        menubar.add_cascade(label="Tools", menu=tools_menu)
-
-        help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="About...", command=self._about)
-        menubar.add_cascade(label="Help", menu=help_menu)
-
+        for title, items in self._menu_spec():
+            sub = tk.Menu(menubar, tearoff=0)
+            self._populate_menu(sub, items)
+            menubar.add_cascade(label=title, menu=sub)
         self.root.config(menu=menubar)
 
+    def _build_menubar_legacy(self, parent):
+        """Custom dark menu bar so it matches the modern theme."""
+        bar = tk.Frame(parent, bg=BG_LEGACY)
+        for title, items in self._menu_spec():
+            menu = tk.Menu(bar, tearoff=0, bg=SURFACE_LEGACY, fg=TEXT_LEGACY, bd=0,
+                           relief="flat", activebackground=PRIMARY, activeforeground=PRIMARY_TEXT,
+                           activeborderwidth=0, font=UI_FONT, selectcolor=PRIMARY)
+            self._populate_menu(menu, items)
+            btn = tk.Label(bar, text=title, bg=BG_LEGACY, fg=TEXT_LEGACY, font=UI_FONT,
+                           padx=12, pady=7, cursor="hand2")
+            btn.bind("<Button-1>",
+                     lambda _e, m=menu, b=btn: m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height()))
+            btn.bind("<Enter>", lambda _e, b=btn: b.config(bg=BTN_LEGACY))
+            btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=BG_LEGACY))
+            btn.pack(side="left")
+        return bar
+
     def _about(self):
-        messagebox.showinfo(
+        self._alert(
             "About " + APP_TITLE,
-            APP_TITLE + " by TheMannster\n\nDownloads TikTok, Instagram Reels, Facebook Reels,\n"
+            APP_TITLE + " by TheMannster\n\nDownloads TikTok, Instagram Reels, Facebook Reels, "
             "and YouTube Shorts.\n\nPowered by yt-dlp.",
+            kind="info",
         )
+
+    # -------------------------------------------------- Notifications
+    def _dialog_palette(self):
+        if self.theme == THEME_RETRO:
+            return {"bg": FACE, "surface": LIGHT, "fg": "#000000", "sub": SHADOW,
+                    "border": SHADOW, "font": WIN95_FONT, "title": WIN95_FONT_BOLD, "dark": False}
+        return {"bg": BG_LEGACY, "surface": SURFACE_LEGACY, "fg": TEXT_LEGACY,
+                "sub": SUBTEXT_LEGACY, "border": BORDER_LEGACY, "font": UI_FONT,
+                "title": ("Segoe UI Semibold", 11), "dark": True}
+
+    _KIND_COLORS = {"info": "#3b82f6", "success": "#22c55e",
+                    "warning": "#f59e0b", "error": "#ef4444"}
+
+    def _play_sound(self, kind):
+        if not self.sound_var.get() or winsound is None:
+            return
+        path = SOUND_ERROR if kind in ("error", "warning") else SOUND_NOTIFY
+        if not os.path.exists(path):
+            return
+        try:
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+        except Exception:
+            pass
+
+    def _notify(self, message, kind="info", duration=4000):
+        """Own toast pop-up (no Windows system sound)."""
+        self._play_sound(kind)
+        pal = self._dialog_palette()
+        accent = self._KIND_COLORS.get(kind, self._KIND_COLORS["info"])
+
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        try:
+            toast.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        border = tk.Frame(toast, bg=pal["border"])
+        border.pack(fill="both", expand=True)
+        body = tk.Frame(border, bg=pal["surface"])
+        body.pack(fill="both", expand=True, padx=1, pady=1)
+        tk.Frame(body, bg=accent, width=4).pack(side="left", fill="y")
+        inner = tk.Frame(body, bg=pal["surface"])
+        inner.pack(side="left", fill="both", expand=True, padx=14, pady=12)
+        tk.Label(inner, text=message, bg=pal["surface"], fg=pal["fg"], font=pal["font"],
+                 justify="left", anchor="w", wraplength=320).pack(anchor="w")
+
+        toast.bind("<Button-1>", lambda _e: self._dismiss_toast(toast))
+        for child in (border, body, inner):
+            child.bind("<Button-1>", lambda _e: self._dismiss_toast(toast))
+
+        self._toasts.append(toast)
+        self._reflow_toasts()
+        self._fade_toast(toast, 0.0, up=True)
+        toast.after(duration, lambda: self._dismiss_toast(toast))
+
+    def _fade_toast(self, toast, alpha, up=True):
+        if not toast.winfo_exists():
+            return
+        alpha = alpha + 0.12 if up else alpha - 0.14
+        alpha = max(0.0, min(0.96, alpha))
+        try:
+            toast.attributes("-alpha", alpha)
+        except tk.TclError:
+            return
+        if up and alpha < 0.96:
+            toast.after(16, lambda: self._fade_toast(toast, alpha, up=True))
+        elif not up and alpha > 0.0:
+            toast.after(16, lambda: self._fade_toast(toast, alpha, up=False))
+        elif not up:
+            if toast in self._toasts:
+                self._toasts.remove(toast)
+            toast.destroy()
+            self._reflow_toasts()
+
+    def _dismiss_toast(self, toast):
+        if toast.winfo_exists():
+            self._fade_toast(toast, 0.96, up=False)
+
+    def _reflow_toasts(self):
+        self.root.update_idletasks()
+        try:
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+        except tk.TclError:
+            return
+        y = ry + rh - 16
+        for toast in reversed([t for t in self._toasts if t.winfo_exists()]):
+            toast.update_idletasks()
+            w = toast.winfo_reqwidth()
+            h = toast.winfo_reqheight()
+            x = rx + rw - w - 16
+            y -= h
+            toast.geometry(f"+{max(x, rx + 8)}+{max(y, ry + 8)}")
+            y -= 8
+
+    def _modal(self, title, message, buttons, kind="info"):
+        """Themed modal dialog. buttons: list of (label, value, accent).
+        Returns the chosen value (or None if closed)."""
+        self._play_sound(kind)
+        pal = self._dialog_palette()
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.configure(bg=pal["bg"])
+        result = {"v": None}
+
+        pad = tk.Frame(win, bg=pal["bg"])
+        pad.pack(fill="both", expand=True, padx=20, pady=18)
+        head = tk.Frame(pad, bg=pal["bg"])
+        head.pack(fill="x", anchor="w")
+        tk.Frame(head, bg=self._KIND_COLORS.get(kind, "#3b82f6"), width=4, height=20).pack(
+            side="left", fill="y", padx=(0, 10))
+        tk.Label(head, text=title, bg=pal["bg"], fg=pal["fg"], font=pal["title"],
+                 anchor="w").pack(side="left")
+        tk.Label(pad, text=message, bg=pal["bg"], fg=pal["sub"], font=pal["font"],
+                 justify="left", anchor="w", wraplength=360).pack(anchor="w", pady=(12, 16))
+
+        row = tk.Frame(pad, bg=pal["bg"])
+        row.pack(fill="x")
+
+        def choose(val):
+            result["v"] = val
+            win.destroy()
+
+        retro = self.theme == THEME_RETRO
+        for label, value, accent in reversed(buttons):
+            if retro:
+                b = make_button(row, label, lambda v=value: choose(v), width=9)
+            else:
+                b = mk_button(row, label, lambda v=value: choose(v),
+                              kind="accent" if accent else "ghost")
+            b.pack(side="right", padx=(6, 0))
+
+        win.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        win.update_idletasks()
+        set_dark_titlebar(win, pal["dark"])
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
+        win.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+        win.grab_set()
+        win.wait_window()
+        return result["v"]
+
+    def _alert(self, title, message, kind="info"):
+        self._modal(title, message, [("OK", True, True)], kind=kind)
+
+    def _confirm(self, title, message, kind="info"):
+        return bool(self._modal(
+            title, message, [("Cancel", False, False), ("Yes", True, True)], kind=kind))
 
     # ---------------------------------------------------- Settings dialog
     def _open_settings(self):
@@ -605,6 +859,14 @@ class DownloaderApp:
                 font=body_font, anchor="w",
             ).pack(anchor="w", pady=2)
 
+        tk.Label(pad, text="Notifications", bg=bg, fg=fg, font=header_font).pack(
+            anchor="w", pady=(16, 0))
+        tk.Checkbutton(
+            pad, text="Play notification sounds", variable=self.sound_var, bg=bg, fg=fg,
+            activebackground=bg, activeforeground=fg,
+            selectcolor=LIGHT if retro else INPUT_LEGACY, font=body_font, anchor="w",
+        ).pack(anchor="w", pady=(4, 0))
+
         btn_row = tk.Frame(pad, bg=bg)
         btn_row.pack(fill="x", pady=(18, 0))
 
@@ -620,6 +882,7 @@ class DownloaderApp:
             mk_button(btn_row, "Cancel", win.destroy).pack(side="right")
 
         win.update_idletasks()
+        set_dark_titlebar(win, not retro)
         x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
         y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
         win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
@@ -746,6 +1009,11 @@ class DownloaderApp:
         return body
 
     def _build_legacy_ui(self):
+        # --- Custom dark menu bar (top) ---------------------------------
+        menubar = self._build_menubar_legacy(self.root)
+        menubar.pack(side="top", fill="x")
+        tk.Frame(self.root, bg=BORDER_LEGACY, height=1).pack(side="top", fill="x")
+
         # --- Always-visible bottom bar (status + version) ---------------
         bar_wrap = tk.Frame(self.root, bg=BG_LEGACY)
         bar_wrap.pack(side="bottom", fill="x")
@@ -814,14 +1082,7 @@ class DownloaderApp:
         qrow = tk.Frame(opts, bg=SURFACE_LEGACY)
         qrow.pack(fill="x", pady=(12, 0))
         mk_caption(qrow, "Quality", SURFACE_LEGACY).pack(side="left", padx=(0, 10))
-        qmenu = tk.OptionMenu(qrow, self.quality_var, *self._quality_options())
-        qmenu.config(font=UI_FONT, bg=INPUT_LEGACY, fg=TEXT_LEGACY, activebackground=BTN_LEGACY_ACTIVE,
-                     activeforeground=TEXT_LEGACY, relief="flat", bd=0, highlightthickness=1,
-                     highlightbackground=BORDER_LEGACY, highlightcolor=BORDER_LEGACY, anchor="w",
-                     padx=10, pady=5, cursor="hand2", width=20)
-        qmenu["menu"].config(bg=INPUT_LEGACY, fg=TEXT_LEGACY, activebackground=PRIMARY,
-                             activeforeground=PRIMARY_TEXT, relief="flat", bd=0, font=UI_FONT)
-        qmenu.pack(side="left")
+        mk_dropdown(qrow, self.quality_var, self._quality_options(), width=22).pack(side="left")
 
         # --- Download / stop --------------------------------------------
         btn_row = tk.Frame(c, bg=BG_LEGACY)
@@ -916,7 +1177,7 @@ class DownloaderApp:
         if self.last_file and os.path.exists(self.last_file):
             self._os_open(self.last_file)
         else:
-            messagebox.showinfo(APP_TITLE, "No downloaded file to open yet.")
+            self._notify("No downloaded file to open yet.", "warning")
 
     def _show_in_folder(self):
         if self.last_file and os.path.exists(self.last_file):
@@ -979,7 +1240,7 @@ class DownloaderApp:
             return
         url = self.url_var.get().strip()
         if not url or not re.match(r"^https?://", url):
-            messagebox.showwarning(APP_TITLE, "Please paste a valid video link first.")
+            self._notify("Please paste a valid video link first.", "warning")
             return
         self.is_busy = True
         self._update_action_buttons()
@@ -1038,11 +1299,12 @@ class DownloaderApp:
         if self.is_downloading or self.is_busy:
             return
         if yt_dlp is None:
-            messagebox.showerror(APP_TITLE, "yt-dlp is not installed.\n\nRun:\npip install -r requirements.txt")
+            self._alert(APP_TITLE, "yt-dlp is not installed.\n\nRun:  pip install -r requirements.txt",
+                        kind="error")
             return
         url = self.url_var.get().strip()
         if not url or not re.match(r"^https?://", url):
-            messagebox.showwarning(APP_TITLE, "Please paste a valid video link (starting with http).")
+            self._notify("Please paste a valid video link (starting with http).", "warning")
             return
 
         folder = self.folder_var.get().strip() or DEFAULT_DOWNLOAD_DIR
@@ -1149,54 +1411,86 @@ class DownloaderApp:
             )
             data = json.load(urllib.request.urlopen(req, timeout=15))
             tag = data.get("tag_name", "")
-            asset_url = None
+            exe_url = installer_url = None
             for asset in data.get("assets", []):
-                if asset.get("name", "").lower().endswith(".exe"):
-                    asset_url = asset.get("browser_download_url")
-                    break
-            self.msg_queue.put(("update_check", tag, asset_url, manual))
+                name = asset.get("name", "").lower()
+                if not name.endswith(".exe"):
+                    continue
+                if "setup" in name or "install" in name:
+                    installer_url = asset.get("browser_download_url")
+                else:
+                    exe_url = asset.get("browser_download_url")
+            self.msg_queue.put(("update_check", tag, exe_url, installer_url, manual))
         except Exception as exc:  # noqa: BLE001
             self.msg_queue.put(("update_check_err", str(exc), manual))
 
-    def _handle_update_check(self, tag, asset_url, manual):
-        if tag and is_newer_version(tag, APP_VERSION):
-            if manual:
-                self.status_var.set("Update available.")
-            if not asset_url:
-                messagebox.showinfo(
-                    APP_TITLE,
-                    f"A new version ({tag}) is available on GitHub, but no installer "
-                    "was attached to the release.",
-                )
-                return
-            answer = messagebox.askyesno(
-                APP_TITLE,
-                f"A new version of {APP_TITLE} is available!\n\n"
-                f"    You have:  v{APP_VERSION}\n"
-                f"    Latest:      {tag}\n\n"
-                "Download and install it now?",
-            )
-            if answer:
-                self._download_and_run_installer(asset_url)
-        else:
+    def _install_dir_writable(self):
+        """True if we can swap the running exe in place (no admin needed)."""
+        if not getattr(sys, "frozen", False):
+            return False
+        try:
+            folder = os.path.dirname(sys.executable)
+            probe = os.path.join(folder, ".tmr_write_test")
+            with open(probe, "w") as fh:
+                fh.write("ok")
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+
+    def _handle_update_check(self, tag, exe_url, installer_url, manual):
+        if not (tag and is_newer_version(tag, APP_VERSION)):
             self.status_var.set(f"You're up to date (v{APP_VERSION}).")
             if manual:
-                messagebox.showinfo(APP_TITLE, f"You're on the latest version (v{APP_VERSION}).")
+                self._notify(f"You're on the latest version (v{APP_VERSION}).", "success")
+            return
 
-    def _download_and_run_installer(self, url: str):
+        if manual:
+            self.status_var.set("Update available.")
+
+        can_swap = bool(exe_url) and self._install_dir_writable()
+        if not can_swap and not installer_url:
+            self._alert(
+                APP_TITLE,
+                f"A new version ({tag}) is available on GitHub, but no downloadable "
+                "build was attached to the release.",
+                kind="warning",
+            )
+            return
+
+        detail = ("It will download in the background, then ask you to reopen the app."
+                  if can_swap else
+                  "This will download and run the installer.")
+        if not self._confirm(
+            "Update available",
+            f"A new version of {APP_TITLE} is available.\n\n"
+            f"You have:  v{APP_VERSION}\nLatest:  {tag}\n\n{detail}\n\nDownload it now?",
+        ):
+            return
+
+        if can_swap:
+            self._start_update_download(exe_url, mode="swap")
+        else:
+            self._start_update_download(installer_url, mode="installer")
+
+    def _start_update_download(self, url: str, mode: str):
         if self.is_busy:
             return
         self.is_busy = True
         self._update_action_buttons()
         self.status_var.set("Downloading update...")
-        self._log(f"Downloading update from {url}")
-        threading.Thread(target=self._download_installer_worker, args=(url,), daemon=True).start()
+        self._log(f"Downloading update ({mode}) from {url}")
+        threading.Thread(target=self._download_update_worker, args=(url, mode),
+                         daemon=True).start()
 
-    def _download_installer_worker(self, url: str):
+    def _download_update_worker(self, url: str, mode: str):
         try:
-            dest = os.path.join(tempfile.gettempdir(), "TMRipper-Setup.exe")
+            if mode == "swap":
+                dest = os.path.join(os.path.dirname(sys.executable), "TM Ripper.new.exe")
+            else:
+                dest = os.path.join(tempfile.gettempdir(), "TMRipper-Setup.exe")
             with urllib.request.urlopen(
-                urllib.request.Request(url, headers={"User-Agent": "TMRipper"}), timeout=60
+                urllib.request.Request(url, headers={"User-Agent": "TMRipper"}), timeout=120
             ) as resp, open(dest, "wb") as fh:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
@@ -1208,16 +1502,52 @@ class DownloaderApp:
                     done += len(chunk)
                     pct = (done / total * 100) if total else 0
                     self.msg_queue.put(("progress", pct, f"Downloading update... {pct:.0f}%"))
-            self.msg_queue.put(("update_ready", dest))
+            self.msg_queue.put(("update_ready", dest, mode))
         except Exception as exc:  # noqa: BLE001
             self.msg_queue.put(("update_err", str(exc)))
+
+    def _apply_exe_update(self, new_path: str):
+        """Swap the freshly downloaded exe in place; no installer needed."""
+        exe = sys.executable
+        old = exe + ".old"
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+            os.rename(exe, old)          # move the running exe aside (allowed on Windows)
+            shutil.move(new_path, exe)   # put the new build in its place
+        except OSError as exc:
+            self._log(f"Could not apply update in place: {exc}", error=True)
+            self.is_busy = False
+            self._update_action_buttons()
+            self._alert(APP_TITLE, f"Couldn't apply the update automatically:\n\n{exc}",
+                        kind="error")
+            return
+
+        self.is_busy = False
+        self._update_action_buttons()
+        self.progress.set(100)
+        self.status_var.set("Update ready \u2013 restart to finish.")
+        self._log("Update downloaded. Restart to finish updating.")
+        if self._confirm(
+            "Update ready",
+            "The update was downloaded and installed.\n\n"
+            "Restart TM Ripper now to finish?",
+            kind="success",
+        ):
+            try:
+                subprocess.Popen([exe], cwd=os.path.dirname(exe))
+            except Exception:
+                pass
+            self.root.after(300, self._on_close)
+        else:
+            self._notify("Update will be applied next time you open TM Ripper.", "info")
 
     def _launch_installer_and_quit(self, path: str):
         self._log("Launching installer; the app will close to finish updating.")
         try:
             self._os_open(path)
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror(APP_TITLE, f"Could not launch installer:\n{exc}")
+            self._alert(APP_TITLE, f"Could not launch installer:\n{exc}", kind="error")
             self.is_busy = False
             self._update_action_buttons()
             return
@@ -1226,7 +1556,7 @@ class DownloaderApp:
     # ----------------------------------------------------- Update yt-dlp
     def _update_downloader(self):
         if self.is_downloading or self.is_busy:
-            messagebox.showinfo(APP_TITLE, "Please wait for the current task to finish.")
+            self._notify("Please wait for the current task to finish.", "info")
             return
         self.is_busy = True
         self._update_action_buttons()
@@ -1265,7 +1595,7 @@ class DownloaderApp:
                     self.status_var.set("Done!")
                     self._log(f"Saved: {title}")
                     self._finish()
-                    messagebox.showinfo(APP_TITLE, f"Download complete!\n\n{title}")
+                    self._notify(f"Download complete!\n{title}", "success")
                 elif kind == "cancelled":
                     self.progress.set(0)
                     self.status_var.set("Cancelled.")
@@ -1276,7 +1606,7 @@ class DownloaderApp:
                     self.status_var.set("Error.")
                     self._log(err, error=True)
                     self._finish()
-                    messagebox.showerror(APP_TITLE, f"Download failed:\n\n{err}")
+                    self._notify(f"Download failed:\n{err}", "error", duration=6000)
                 elif kind == "preview":
                     _, meta, img = msg
                     self.is_busy = False
@@ -1297,32 +1627,34 @@ class DownloaderApp:
                     self.status_var.set("Update complete." if ok else "Update failed.")
                     self._log(("yt-dlp: " if ok else "Update error: ") + summary, error=not ok)
                     self._update_action_buttons()
-                    messagebox.showinfo(
-                        APP_TITLE,
-                        ("yt-dlp updated.\nRestart the app to use the new version."
-                         if ok else "Update failed:\n\n" + summary),
-                    )
+                    if ok:
+                        self._notify("yt-dlp updated. Restart to use the new version.", "success")
+                    else:
+                        self._notify("yt-dlp update failed:\n" + summary, "error", duration=6000)
                 elif kind == "update_check":
-                    _, tag, asset_url, manual = msg
-                    self._handle_update_check(tag, asset_url, manual)
+                    _, tag, exe_url, installer_url, manual = msg
+                    self._handle_update_check(tag, exe_url, installer_url, manual)
                 elif kind == "update_check_err":
                     _, err, manual = msg
                     self._log("Update check failed: " + err, error=True)
                     if manual:
                         self.status_var.set("Update check failed.")
-                        messagebox.showwarning(APP_TITLE, "Couldn't check for updates:\n\n" + err)
+                        self._notify("Couldn't check for updates:\n" + err, "warning")
                 elif kind == "update_ready":
-                    _, path = msg
+                    _, path, mode = msg
                     self.progress.set(100)
-                    self.status_var.set("Update downloaded. Launching installer...")
-                    self._launch_installer_and_quit(path)
+                    if mode == "swap":
+                        self._apply_exe_update(path)
+                    else:
+                        self.status_var.set("Update downloaded. Launching installer...")
+                        self._launch_installer_and_quit(path)
                 elif kind == "update_err":
                     _, err = msg
                     self.is_busy = False
                     self.status_var.set("Update failed.")
                     self._log("Update download failed: " + err, error=True)
                     self._update_action_buttons()
-                    messagebox.showerror(APP_TITLE, "Update download failed:\n\n" + err)
+                    self._notify("Update download failed:\n" + err, "error", duration=6000)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
@@ -1346,8 +1678,20 @@ def _create_app_mutex():
             pass
 
 
+def _cleanup_old_update():
+    """Delete the previous exe left behind by an in-app update swap."""
+    if getattr(sys, "frozen", False):
+        old = sys.executable + ".old"
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+        except OSError:
+            pass
+
+
 def main():
     _create_app_mutex()
+    _cleanup_old_update()
     if _DND_AVAILABLE:
         root = TkinterDnD.Tk()
     else:
