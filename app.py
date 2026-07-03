@@ -68,7 +68,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -539,8 +539,15 @@ class DownloaderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("520x900")
-        self.root.minsize(460, 560)
+        # High-DPI: scale fonts (points) via Tk and the window (pixels) by the factor.
+        dpi = _system_dpi()
+        self.scale = max(1.0, dpi / 96.0)
+        try:
+            self.root.tk.call("tk", "scaling", dpi / 72.0)
+        except tk.TclError:
+            pass
+        self.root.geometry(f"{int(520 * self.scale)}x{int(900 * self.scale)}")
+        self.root.minsize(int(460 * self.scale), int(560 * self.scale))
         self._legacy_logo_ref = None
         self._toasts = []
         self._apply_window_icon()
@@ -1730,6 +1737,42 @@ def _create_app_mutex():
             pass
 
 
+def _enable_dpi_awareness():
+    """Tell Windows we handle high-DPI so the UI (and file dialogs) stay crisp."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:  # Per-Monitor v2 (Win10 1703+): sharpest, handles dialogs well
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:  # System DPI aware (Win8.1+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def _system_dpi():
+    if sys.platform != "win32":
+        return 96
+    import ctypes
+
+    try:
+        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+        return dpi or 96
+    except Exception:
+        return 96
+
+
 def _cleanup_old_update():
     """Delete the previous exe left behind by an in-app update swap."""
     if getattr(sys, "frozen", False):
@@ -1742,6 +1785,7 @@ def _cleanup_old_update():
 
 
 def main():
+    _enable_dpi_awareness()
     _create_app_mutex()
     _cleanup_old_update()
     if _DND_AVAILABLE:
