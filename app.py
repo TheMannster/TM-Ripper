@@ -28,7 +28,7 @@ import threading
 import subprocess
 import urllib.request
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 
 try:
     import yt_dlp
@@ -62,7 +62,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -132,15 +132,29 @@ WIN95_FONT_BOLD = ("MS Sans Serif", 8, "bold")
 WIN95_TITLE_FONT = ("MS Sans Serif", 11, "bold")
 WIN95_MONO = ("Courier New", 8)
 
-# --- Modern (legacy) palette : dark grey, easy on the eyes --------------
-PRIMARY = "#dc2626"         # TM crimson
-PRIMARY_ACTIVE = "#ef4444"  # brighter crimson (hover/pressed)
-BG_LEGACY = "#2b2d31"       # main dark grey
-SURFACE_LEGACY = "#1e1f22"  # darker surface (cards, inputs, log)
-BTN_LEGACY = "#3a3d43"      # neutral button face
-BTN_LEGACY_ACTIVE = "#4a4e55"
-TEXT_LEGACY = "#dbdee1"     # primary light text
-SUBTEXT_LEGACY = "#9aa0a6"  # muted text
+# --- Modern (legacy) palette : deep dark, easy on the eyes --------------
+PRIMARY = "#e11d2a"          # TM crimson
+PRIMARY_ACTIVE = "#f5333f"   # brighter crimson (hover/pressed)
+PRIMARY_DISABLED = "#5a2226"
+PRIMARY_TEXT = "#ffffff"
+BG_LEGACY = "#17181c"        # app background (near-black)
+SURFACE_LEGACY = "#1f2126"   # cards / log
+INPUT_LEGACY = "#26282e"     # input fields
+BORDER_LEGACY = "#33363d"    # subtle 1px borders
+BTN_LEGACY = "#2b2e35"       # neutral button face
+BTN_LEGACY_ACTIVE = "#373b43"
+TEXT_LEGACY = "#e9eaec"      # primary light text
+SUBTEXT_LEGACY = "#8e96a2"   # muted text
+HEADING_LEGACY = "#ffffff"
+DISABLED_TEXT_LEGACY = "#5c6069"
+
+# Modern fonts (Segoe UI ships with Windows; graceful fallback elsewhere)
+UI_FONT = ("Segoe UI", 10)
+UI_FONT_SM = ("Segoe UI", 9)
+UI_FONT_BOLD = ("Segoe UI Semibold", 10)
+UI_TITLE = ("Segoe UI Semibold", 20)
+UI_LABEL = ("Segoe UI Semibold", 9)
+UI_MONO = ("Consolas", 9)
 
 
 def load_settings() -> dict:
@@ -265,9 +279,99 @@ class Win95Progress(tk.Canvas):
             x += block_w + gap
 
 
-class ModernProgress(ttk.Progressbar):
+# ---------------------------------------------------------- Modern helpers
+def mk_button(parent, text, command, kind="ghost", **kw):
+    """Flat, hover-aware button for the modern theme.
+
+    kind: "accent" (crimson call-to-action) or "ghost" (neutral surface).
+    """
+    if kind == "accent":
+        base, hover, fg = PRIMARY, PRIMARY_ACTIVE, PRIMARY_TEXT
+        font = ("Segoe UI Semibold", 11)
+    else:
+        base, hover, fg = BTN_LEGACY, BTN_LEGACY_ACTIVE, TEXT_LEGACY
+        font = UI_FONT
+    btn = tk.Button(
+        parent, text=text, command=command, font=font,
+        bg=base, fg=fg, activebackground=hover, activeforeground=fg,
+        relief="flat", bd=0, cursor="hand2", padx=14, pady=8,
+        highlightthickness=0, disabledforeground=DISABLED_TEXT_LEGACY, **kw,
+    )
+    btn._base_bg = base
+    btn._hover_bg = hover
+
+    def on_enter(_):
+        if str(btn["state"]) != "disabled":
+            btn.config(bg=hover)
+
+    def on_leave(_):
+        if str(btn["state"]) != "disabled":
+            btn.config(bg=btn._base_bg)
+
+    btn.bind("<Enter>", on_enter)
+    btn.bind("<Leave>", on_leave)
+    return btn
+
+
+def mk_entry(parent, textvariable, font=("Segoe UI", 11)):
+    """Flat entry wrapped in a 1px frame that glows crimson on focus.
+
+    Returns (wrapper, entry). Pack/grid the wrapper; use the entry for refs.
+    """
+    wrap = tk.Frame(parent, bg=BORDER_LEGACY, bd=0, highlightthickness=0)
+    inner = tk.Frame(wrap, bg=INPUT_LEGACY)
+    inner.pack(fill="both", expand=True, padx=1, pady=1)
+    entry = tk.Entry(
+        inner, textvariable=textvariable, font=font, bg=INPUT_LEGACY, fg=TEXT_LEGACY,
+        insertbackground=TEXT_LEGACY, relief="flat", bd=0, highlightthickness=0,
+    )
+    entry.pack(fill="both", expand=True, padx=10, pady=8)
+    entry.bind("<FocusIn>", lambda _: wrap.config(bg=PRIMARY))
+    entry.bind("<FocusOut>", lambda _: wrap.config(bg=BORDER_LEGACY))
+    return wrap, entry
+
+
+def mk_card(parent):
+    return tk.Frame(parent, bg=SURFACE_LEGACY, bd=0,
+                    highlightbackground=BORDER_LEGACY, highlightthickness=1)
+
+
+def mk_caption(parent, text, bg):
+    return tk.Label(parent, text=text.upper(), bg=bg, fg=SUBTEXT_LEGACY,
+                    font=UI_LABEL, anchor="w")
+
+
+class ModernBar(tk.Canvas):
+    """Slim, rounded, single-fill progress bar for the modern theme."""
+
+    def __init__(self, master, **kw):
+        super().__init__(master, height=8, bg=INPUT_LEGACY, bd=0,
+                         highlightthickness=0, **kw)
+        self._value = 0
+        self.bind("<Configure>", lambda e: self._redraw())
+
     def set(self, value):
-        self.config(value=value)
+        self._value = max(0, min(100, value))
+        self._redraw()
+
+    def _round_rect(self, x1, y1, x2, y2, r, color):
+        if x2 - x1 < 2 * r:
+            r = (x2 - x1) / 2
+        self.create_oval(x1, y1, x1 + 2 * r, y2, fill=color, outline=color)
+        self.create_oval(x2 - 2 * r, y1, x2, y2, fill=color, outline=color)
+        self.create_rectangle(x1 + r, y1, x2 - r, y2, fill=color, outline=color)
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1:
+            return
+        r = h / 2
+        self._round_rect(0, 0, w, h, r, INPUT_LEGACY)
+        fill_w = (self._value / 100.0) * w
+        if fill_w > 1:
+            self._round_rect(0, 0, max(fill_w, h), h, r, PRIMARY)
 
 
 class DiscordRP:
@@ -326,8 +430,9 @@ class DownloaderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("680x680")
-        self.root.minsize(620, 620)
+        self.root.geometry("720x940")
+        self.root.minsize(560, 600)
+        self._legacy_logo_ref = None
         self._apply_window_icon()
 
         self.msg_queue: "queue.Queue[tuple]" = queue.Queue()
@@ -352,6 +457,9 @@ class DownloaderApp:
         self.quality_var = tk.StringVar(value=settings.get("quality", "Best video + audio"))
         self.status_var = tk.StringVar(value="Ready.")
         self.url_var.trace_add("write", self._on_url_change)
+        # Persist folder/quality the moment they change so settings never get lost.
+        self.folder_var.trace_add("write", lambda *_: self._persist())
+        self.quality_var.trace_add("write", lambda *_: self._persist())
 
         self.log_history: list[tuple[str, bool]] = []
         self._update_checked = False
@@ -369,6 +477,7 @@ class DownloaderApp:
             self.root.after(1500, lambda: self._check_app_updates(manual=False))
 
     def _on_close(self):
+        self._persist()
         self.discord.close()
         self.root.destroy()
 
@@ -470,31 +579,34 @@ class DownloaderApp:
         win.grab_set()
 
         retro = self.theme == THEME_RETRO
-        bg = FACE if retro else "#ffffff"
+        bg = FACE if retro else BG_LEGACY
+        fg = "#000000" if retro else TEXT_LEGACY
+        subfg = "#333333" if retro else SUBTEXT_LEGACY
         win.configure(bg=bg)
         choice = tk.StringVar(value=self.theme)
 
         pad = tk.Frame(win, bg=bg)
-        pad.pack(padx=16, pady=14, fill="both")
-        header_font = WIN95_FONT_BOLD if retro else ("Segoe UI", 11, "bold")
-        body_font = WIN95_FONT if retro else ("Segoe UI", 10)
+        pad.pack(padx=18, pady=16, fill="both")
+        header_font = WIN95_FONT_BOLD if retro else ("Segoe UI Semibold", 12)
+        body_font = WIN95_FONT if retro else UI_FONT
 
-        tk.Label(pad, text="Appearance", bg=bg, fg="#000000", font=header_font).pack(anchor="w")
-        tk.Label(pad, text="Choose how the app looks:", bg=bg, fg="#333333", font=body_font).pack(
-            anchor="w", pady=(2, 10)
+        tk.Label(pad, text="Appearance", bg=bg, fg=fg, font=header_font).pack(anchor="w")
+        tk.Label(pad, text="Choose how the app looks:", bg=bg, fg=subfg, font=body_font).pack(
+            anchor="w", pady=(2, 12)
         )
         for label, value in (
             ("Legacy  -  clean modern flat UI", THEME_LEGACY),
             ("Retro  -  Windows 95 style", THEME_RETRO),
         ):
             tk.Radiobutton(
-                pad, text=label, variable=choice, value=value, bg=bg, fg="#000000",
-                activebackground=bg, selectcolor=LIGHT if retro else "#ffffff",
+                pad, text=label, variable=choice, value=value, bg=bg, fg=fg,
+                activebackground=bg, activeforeground=fg,
+                selectcolor=LIGHT if retro else INPUT_LEGACY,
                 font=body_font, anchor="w",
-            ).pack(anchor="w", pady=1)
+            ).pack(anchor="w", pady=2)
 
         btn_row = tk.Frame(pad, bg=bg)
-        btn_row.pack(fill="x", pady=(16, 0))
+        btn_row.pack(fill="x", pady=(18, 0))
 
         def apply_and_close():
             self._apply_theme(choice.get())
@@ -504,8 +616,8 @@ class DownloaderApp:
             make_button(btn_row, "OK", apply_and_close, width=8).pack(side="right", padx=(6, 0))
             make_button(btn_row, "Cancel", win.destroy, width=8).pack(side="right")
         else:
-            ttk.Button(btn_row, text="OK", command=apply_and_close).pack(side="right", padx=(6, 0))
-            ttk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="right")
+            mk_button(btn_row, "OK", apply_and_close, kind="accent").pack(side="right", padx=(6, 0))
+            mk_button(btn_row, "Cancel", win.destroy).pack(side="right")
 
         win.update_idletasks()
         x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
@@ -614,134 +726,137 @@ class DownloaderApp:
             self._log("yt-dlp is not installed. Run:  pip install -r requirements.txt", error=True)
 
     # ------------------------------------------------------ Legacy UI build
-    def _build_legacy_ui(self):
-        style = ttk.Style()
+    def _legacy_logo(self, size):
+        if not (Image and ImageTk and os.path.exists(ICON_PNG)):
+            return None
         try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("TButton", padding=8, font=("Segoe UI", 10),
-                        background=BTN_LEGACY, foreground=TEXT_LEGACY, borderwidth=0)
-        style.map("TButton",
-                  background=[("active", BTN_LEGACY_ACTIVE), ("disabled", "#2f3136")],
-                  foreground=[("disabled", "#6b6f76")])
-        style.configure("Accent.TButton", padding=10, font=("Segoe UI", 11, "bold"),
-                        foreground="white", background=PRIMARY, borderwidth=0)
-        style.map("Accent.TButton",
-                  background=[("active", PRIMARY_ACTIVE), ("disabled", "#5a2222")],
-                  foreground=[("disabled", "#c9a3a3")])
-        style.configure("TLabel", font=("Segoe UI", 10), background=BG_LEGACY, foreground=TEXT_LEGACY)
-        style.configure("TFrame", background=BG_LEGACY)
-        style.configure("Card.TFrame", background=SURFACE_LEGACY)
-        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"),
-                        background=BG_LEGACY, foreground="#ffffff")
-        style.configure("Sub.TLabel", font=("Segoe UI", 9),
-                        foreground=SUBTEXT_LEGACY, background=BG_LEGACY)
-        style.configure("Meta.TLabel", font=("Segoe UI", 9),
-                        background=SURFACE_LEGACY, foreground=TEXT_LEGACY)
-        # Inputs
-        style.configure("TEntry", fieldbackground=SURFACE_LEGACY, foreground=TEXT_LEGACY,
-                        insertcolor=TEXT_LEGACY, bordercolor="#111", lightcolor=SURFACE_LEGACY,
-                        darkcolor=SURFACE_LEGACY)
-        style.configure("TCombobox", fieldbackground=SURFACE_LEGACY, background=BTN_LEGACY,
-                        foreground=TEXT_LEGACY, arrowcolor=TEXT_LEGACY, bordercolor="#111")
-        style.map("TCombobox", fieldbackground=[("readonly", SURFACE_LEGACY)],
-                  foreground=[("readonly", TEXT_LEGACY)])
-        # Combobox dropdown list colors
-        self.root.option_add("*TCombobox*Listbox.background", SURFACE_LEGACY)
-        self.root.option_add("*TCombobox*Listbox.foreground", TEXT_LEGACY)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", PRIMARY)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-        # Progress bar
-        style.configure("Horizontal.TProgressbar", background=PRIMARY, troughcolor=SURFACE_LEGACY,
-                        bordercolor=SURFACE_LEGACY, lightcolor=PRIMARY, darkcolor=PRIMARY)
-        # Scrollbar
-        style.configure("TScrollbar", background=BTN_LEGACY, troughcolor=BG_LEGACY,
-                        arrowcolor=TEXT_LEGACY, bordercolor=BG_LEGACY)
+            im = Image.open(ICON_PNG).convert("RGBA")
+            im.thumbnail((size, size))
+            self._legacy_logo_ref = ImageTk.PhotoImage(im)
+            return self._legacy_logo_ref
+        except Exception:
+            return None
 
-        container = ttk.Frame(self.root, padding=20)
-        container.pack(fill="both", expand=True)
+    def _card_body(self, parent, padx=16, pady=14, **pack_kw):
+        """A bordered surface card; returns the padded inner frame to fill."""
+        card = mk_card(parent)
+        card.pack(fill="x", **pack_kw)
+        body = tk.Frame(card, bg=SURFACE_LEGACY)
+        body.pack(fill="both", expand=True, padx=padx, pady=pady)
+        return body
 
-        ttk.Label(container, text="TM Ripper", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(container,
-                  text="Download TikTok  \u2022  Instagram Reels  \u2022  Facebook Reels  \u2022  YouTube Shorts",
-                  style="Sub.TLabel").pack(anchor="w", pady=(0, 15))
+    def _build_legacy_ui(self):
+        # --- Always-visible bottom bar (status + version) ---------------
+        bar_wrap = tk.Frame(self.root, bg=BG_LEGACY)
+        bar_wrap.pack(side="bottom", fill="x")
+        tk.Frame(bar_wrap, bg=BORDER_LEGACY, height=1).pack(fill="x")
+        bar = tk.Frame(bar_wrap, bg=BG_LEGACY)
+        bar.pack(fill="x", padx=18, pady=6)
+        tk.Label(bar, textvariable=self.status_var, bg=BG_LEGACY, fg=SUBTEXT_LEGACY,
+                 font=UI_FONT_SM, anchor="w").pack(side="left")
+        tk.Label(bar, text=f"TM Ripper v{APP_VERSION}  \u2022  by TheMannster", bg=BG_LEGACY,
+                 fg=SUBTEXT_LEGACY, font=UI_FONT_SM, anchor="e").pack(side="right")
 
-        url_frame = ttk.Frame(container)
-        url_frame.pack(fill="x")
-        ttk.Label(url_frame, text="Video link").pack(anchor="w")
-        entry_row = ttk.Frame(url_frame)
-        entry_row.pack(fill="x", pady=(4, 2))
-        self.url_entry = ttk.Entry(entry_row, textvariable=self.url_var, font=("Segoe UI", 11))
-        self.url_entry.pack(side="left", fill="x", expand=True, ipady=4)
-        ttk.Button(entry_row, text="Paste", command=self._paste).pack(side="left", padx=(8, 0))
-        ttk.Button(entry_row, text="Clear", command=self._clear).pack(side="left", padx=(6, 0))
-        row2 = ttk.Frame(url_frame)
-        row2.pack(fill="x", pady=(2, 12))
-        self.platform_label = ttk.Label(row2, text="Platform: \u2014", style="Sub.TLabel")
+        outer = tk.Frame(self.root, bg=BG_LEGACY)
+        outer.pack(side="top", fill="both", expand=True)
+        c = tk.Frame(outer, bg=BG_LEGACY)
+        c.pack(fill="both", expand=True, padx=24, pady=(18, 8))
+
+        # --- Header (logo + wordmark) -----------------------------------
+        header = tk.Frame(c, bg=BG_LEGACY)
+        header.pack(fill="x", pady=(0, 16))
+        logo = self._legacy_logo(40)
+        if logo is not None:
+            tk.Label(header, image=logo, bg=BG_LEGACY).pack(side="left", padx=(0, 12))
+        titles = tk.Frame(header, bg=BG_LEGACY)
+        titles.pack(side="left", anchor="w")
+        tk.Label(titles, text="TM Ripper", bg=BG_LEGACY, fg=HEADING_LEGACY,
+                 font=UI_TITLE, anchor="w").pack(anchor="w")
+        tk.Label(titles,
+                 text="TikTok  \u2022  Instagram Reels  \u2022  Facebook Reels  \u2022  YouTube Shorts",
+                 bg=BG_LEGACY, fg=SUBTEXT_LEGACY, font=UI_FONT_SM, anchor="w").pack(anchor="w")
+
+        # --- Link card --------------------------------------------------
+        link = self._card_body(c, pady=(14, 14))
+        mk_caption(link, "Video link", SURFACE_LEGACY).pack(anchor="w", pady=(0, 6))
+        entry_row = tk.Frame(link, bg=SURFACE_LEGACY)
+        entry_row.pack(fill="x")
+        wrap, self.url_entry = mk_entry(entry_row, self.url_var)
+        wrap.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        mk_button(entry_row, "Paste", self._paste).pack(side="left", padx=(0, 6))
+        mk_button(entry_row, "Clear", self._clear).pack(side="left")
+        row2 = tk.Frame(link, bg=SURFACE_LEGACY)
+        row2.pack(fill="x", pady=(10, 0))
+        self.platform_label = tk.Label(row2, text="Platform: \u2014", bg=SURFACE_LEGACY,
+                                       fg=SUBTEXT_LEGACY, font=UI_FONT_SM, anchor="w")
         self.platform_label.pack(side="left")
-        self.preview_btn = ttk.Button(row2, text="Preview", command=self._start_preview)
+        self.preview_btn = mk_button(row2, "Preview", self._start_preview)
         self.preview_btn.pack(side="right")
 
-        prev_card = ttk.Frame(container, style="Card.TFrame", padding=10)
-        prev_card.pack(fill="x", pady=(0, 12))
-        self.thumb_label = tk.Label(prev_card, bg=SURFACE_LEGACY, text="(no preview)",
-                                    fg=SUBTEXT_LEGACY, font=("Segoe UI", 9), width=30, height=6)
-        self.thumb_label.pack(side="left", padx=(0, 12))
-        self.meta_label = ttk.Label(prev_card, text="", style="Meta.TLabel", justify="left",
-                                    anchor="nw", wraplength=340)
+        # --- Preview card -----------------------------------------------
+        prev = self._card_body(c, pady=(12, 0))
+        self.thumb_label = tk.Label(prev, bg=SURFACE_LEGACY, text="(no preview)",
+                                    fg=SUBTEXT_LEGACY, font=UI_FONT_SM, width=30, height=5)
+        self.thumb_label.pack(side="left", padx=(0, 14))
+        self.meta_label = tk.Label(prev, text="", bg=SURFACE_LEGACY, fg=TEXT_LEGACY,
+                                   font=UI_FONT_SM, justify="left", anchor="nw", wraplength=340)
         self.meta_label.pack(side="left", fill="both", expand=True)
 
-        out_frame = ttk.Frame(container)
-        out_frame.pack(fill="x")
-        ttk.Label(out_frame, text="Save to folder").pack(anchor="w")
-        out_row = ttk.Frame(out_frame)
-        out_row.pack(fill="x", pady=(4, 12))
-        ttk.Entry(out_row, textvariable=self.folder_var, font=("Segoe UI", 10)).pack(
-            side="left", fill="x", expand=True, ipady=3)
-        ttk.Button(out_row, text="Browse", command=self._browse).pack(side="left", padx=(8, 0))
-        ttk.Button(out_row, text="Open", command=self._open_folder).pack(side="left", padx=(6, 0))
+        # --- Options card (destination + quality) -----------------------
+        opts = self._card_body(c, pady=(12, 0))
+        mk_caption(opts, "Save to folder", SURFACE_LEGACY).pack(anchor="w", pady=(0, 6))
+        out_row = tk.Frame(opts, bg=SURFACE_LEGACY)
+        out_row.pack(fill="x")
+        fwrap, _ = mk_entry(out_row, self.folder_var, font=UI_FONT)
+        fwrap.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        mk_button(out_row, "Browse", self._browse).pack(side="left", padx=(0, 6))
+        mk_button(out_row, "Open", self._open_folder).pack(side="left")
+        qrow = tk.Frame(opts, bg=SURFACE_LEGACY)
+        qrow.pack(fill="x", pady=(12, 0))
+        mk_caption(qrow, "Quality", SURFACE_LEGACY).pack(side="left", padx=(0, 10))
+        qmenu = tk.OptionMenu(qrow, self.quality_var, *self._quality_options())
+        qmenu.config(font=UI_FONT, bg=INPUT_LEGACY, fg=TEXT_LEGACY, activebackground=BTN_LEGACY_ACTIVE,
+                     activeforeground=TEXT_LEGACY, relief="flat", bd=0, highlightthickness=1,
+                     highlightbackground=BORDER_LEGACY, highlightcolor=BORDER_LEGACY, anchor="w",
+                     padx=10, pady=5, cursor="hand2", width=20)
+        qmenu["menu"].config(bg=INPUT_LEGACY, fg=TEXT_LEGACY, activebackground=PRIMARY,
+                             activeforeground=PRIMARY_TEXT, relief="flat", bd=0, font=UI_FONT)
+        qmenu.pack(side="left")
 
-        opt_frame = ttk.Frame(container)
-        opt_frame.pack(fill="x", pady=(0, 12))
-        ttk.Label(opt_frame, text="Quality").pack(side="left")
-        ttk.Combobox(opt_frame, textvariable=self.quality_var, state="readonly", width=22,
-                     values=self._quality_options()).pack(side="left", padx=(8, 0))
-
-        btn_row = ttk.Frame(container)
-        btn_row.pack(fill="x", pady=(0, 10))
-        self.download_btn = ttk.Button(btn_row, text="\u2b07  Download", style="Accent.TButton",
-                                       command=self._start_download)
-        self.download_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self.cancel_btn = ttk.Button(btn_row, text="Stop", command=self._cancel_download)
+        # --- Download / stop --------------------------------------------
+        btn_row = tk.Frame(c, bg=BG_LEGACY)
+        btn_row.pack(fill="x", pady=(14, 10))
+        self.download_btn = mk_button(btn_row, "\u2b07  Download", self._start_download, kind="accent")
+        self.download_btn.config(pady=11)
+        self.download_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.cancel_btn = mk_button(btn_row, "Stop", self._cancel_download)
+        self.cancel_btn.config(pady=11)
         self.cancel_btn.pack(side="left")
 
-        self.progress = ModernProgress(container, mode="determinate", maximum=100)
-        self.progress.pack(fill="x")
-        ttk.Label(container, textvariable=self.status_var, style="Sub.TLabel").pack(anchor="w", pady=(4, 6))
+        self.progress = ModernBar(c)
+        self.progress.pack(fill="x", pady=(0, 12))
 
-        done_row = ttk.Frame(container)
-        done_row.pack(fill="x", pady=(0, 8))
-        self.open_file_btn = ttk.Button(done_row, text="Open file", command=self._open_last_file)
+        done_row = tk.Frame(c, bg=BG_LEGACY)
+        done_row.pack(fill="x", pady=(0, 12))
+        self.open_file_btn = mk_button(done_row, "Open file", self._open_last_file)
         self.open_file_btn.pack(side="left", padx=(0, 6))
-        self.show_folder_btn = ttk.Button(done_row, text="Show in folder", command=self._show_in_folder)
+        self.show_folder_btn = mk_button(done_row, "Show in folder", self._show_in_folder)
         self.show_folder_btn.pack(side="left")
 
-        ttk.Label(container, text="Log").pack(anchor="w")
-        log_frame = ttk.Frame(container)
-        log_frame.pack(fill="both", expand=True, pady=(4, 0))
-        self.log = tk.Text(log_frame, height=6, wrap="word", font=("Consolas", 9),
-                           relief="flat", bd=0)
-        self.log.configure(bg=SURFACE_LEGACY, fg=TEXT_LEGACY, insertbackground=TEXT_LEGACY)
+        # --- Log --------------------------------------------------------
+        mk_caption(c, "Log", BG_LEGACY).pack(anchor="w", pady=(0, 6))
+        log_card = mk_card(c)
+        log_card.pack(fill="both", expand=True)
+        log_frame = tk.Frame(log_card, bg=SURFACE_LEGACY)
+        log_frame.pack(fill="both", expand=True, padx=2, pady=2)
+        self.log = tk.Text(log_frame, height=4, wrap="word", font=UI_MONO, relief="flat", bd=0,
+                           bg=SURFACE_LEGACY, fg=TEXT_LEGACY, insertbackground=TEXT_LEGACY,
+                           padx=10, pady=8, highlightthickness=0)
         self.log.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
+        scroll = tk.Scrollbar(log_frame, command=self.log.yview, relief="flat", bd=0,
+                              troughcolor=SURFACE_LEGACY, bg=BTN_LEGACY, activebackground=BTN_LEGACY_ACTIVE)
         scroll.pack(side="right", fill="y")
         self.log.configure(yscrollcommand=scroll.set, state="disabled")
-
-        footer = ttk.Frame(container)
-        footer.pack(fill="x", pady=(6, 0))
-        ttk.Label(footer, text=f"TM Ripper v{APP_VERSION}  \u2022  by TheMannster",
-                  style="Sub.TLabel").pack(side="right")
 
         if yt_dlp is None:
             self._log("yt-dlp is not installed. Run:  pip install -r requirements.txt", error=True)
