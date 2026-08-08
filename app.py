@@ -10,6 +10,8 @@ Features:
   * Cancel/Stop an in-progress download
   * Live progress with speed, ETA, and file size
   * Open the file / show it in its folder when done
+  * Download history with convert-to-other-formats (via ffmpeg)
+  * Convert any local media file
   * Drag-and-drop a link onto the window
   * One-click "Update downloader" (keeps yt-dlp current)
 
@@ -69,9 +71,10 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.2.0"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+HISTORY_MAX = 100
 
 # Discord Rich Presence. Create an app at https://discord.com/developers/applications
 # then paste its Application (Client) ID here. Upload the logo under
@@ -97,6 +100,7 @@ except OSError:
     CONFIG_DIR = APP_DIR
 
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
+HISTORY_PATH = os.path.join(CONFIG_DIR, "history.json")
 ICON_ICO = os.path.join(BUNDLE_DIR, "assets", "icon.ico")
 ICON_PNG = os.path.join(BUNDLE_DIR, "assets", "icon.png")
 SOUND_NOTIFY = os.path.join(BUNDLE_DIR, "assets", "notify.wav")
@@ -117,13 +121,49 @@ def find_ffmpeg_dir():
         os.path.join(BUNDLE_DIR, "ffmpeg"),
         os.path.join(BUNDLE_DIR, "vendor", "ffmpeg"),
     ]
+    exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
     for d in candidates:
-        if os.path.isfile(os.path.join(d, "ffmpeg.exe")):
+        if os.path.isfile(os.path.join(d, exe_name)):
             return d
     return None
 
 
 FFMPEG_DIR = find_ffmpeg_dir()
+
+
+def ffmpeg_executable() -> str | None:
+    """Full path to ffmpeg, or 'ffmpeg' if only on PATH, or None if missing."""
+    name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    if FFMPEG_DIR:
+        path = os.path.join(FFMPEG_DIR, name)
+        if os.path.isfile(path):
+            return path
+    found = shutil.which(name)
+    return found
+
+
+# Display label -> (extension, ffmpeg args after -i input, before output)
+CONVERT_TARGETS = {
+    "MP4 (H.264 video)": ("mp4", ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                                  "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]),
+    "MKV (remux/copy)": ("mkv", ["-c", "copy"]),
+    "WebM (VP9 video)": ("webm", ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0",
+                                  "-c:a", "libopus", "-b:a", "128k"]),
+    "MOV (H.264 video)": ("mov", ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                                  "-c:a", "aac", "-b:a", "192k"]),
+    "GIF (animated)": ("gif", ["-vf", "fps=12,scale=480:-1:flags=lanczos", "-loop", "0"]),
+    "MP3 (audio)": ("mp3", ["-vn", "-c:a", "libmp3lame", "-b:a", "192k"]),
+    "M4A (audio)": ("m4a", ["-vn", "-c:a", "aac", "-b:a", "192k"]),
+    "WAV (audio)": ("wav", ["-vn", "-c:a", "pcm_s16le"]),
+    "FLAC (audio)": ("flac", ["-vn", "-c:a", "flac"]),
+    "OGG (audio)": ("ogg", ["-vn", "-c:a", "libvorbis", "-q:a", "5"]),
+}
+
+MEDIA_FILETYPES = [
+    ("Media files", "*.mp4 *.mkv *.webm *.mov *.avi *.m4v *.mp3 *.m4a *.wav *.flac "
+                    "*.ogg *.opus *.gif *.aac *.wma"),
+    ("All files", "*.*"),
+]
 
 THEME_RETRO = "retro"
 THEME_LEGACY = "legacy"
@@ -180,6 +220,84 @@ def save_settings(data: dict) -> None:
             json.dump(data, fh, indent=2)
     except OSError:
         pass
+
+
+def load_history() -> list:
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_history(entries: list) -> None:
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as fh:
+            json.dump(entries[:HISTORY_MAX], fh, indent=2)
+    except OSError:
+        pass
+
+
+def history_add(entries: list, *, title: str, path: str, url: str = "",
+                platform: str = "", quality: str = "") -> list:
+    """Prepend a download/convert record and persist. Returns the new list."""
+    entry = {
+        "id": f"{int(time.time() * 1000)}-{os.path.basename(path or '')}",
+        "title": title or os.path.basename(path or "file"),
+        "path": path or "",
+        "url": url or "",
+        "platform": platform or "",
+        "quality": quality or "",
+        "ts": int(time.time()),
+    }
+    # Drop older duplicates of the same path so the newest stays on top.
+    norm = os.path.normcase(os.path.normpath(path)) if path else ""
+    filtered = [
+        e for e in entries
+        if os.path.normcase(os.path.normpath(e.get("path") or "")) != norm
+    ]
+    updated = [entry] + filtered
+    save_history(updated)
+    return updated
+
+
+def default_convert_output(src: str, ext: str) -> str:
+    base, _ = os.path.splitext(src)
+    candidate = f"{base}.{ext}"
+    if not os.path.exists(candidate):
+        return candidate
+    n = 2
+    while True:
+        candidate = f"{base} ({n}).{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
+def run_ffmpeg_convert(src: str, dest: str, fmt_label: str,
+                       on_stderr=None) -> None:
+    """Convert src -> dest using CONVERT_TARGETS[fmt_label]. Raises on failure."""
+    if fmt_label not in CONVERT_TARGETS:
+        raise ValueError(f"Unknown format: {fmt_label}")
+    ff = ffmpeg_executable()
+    if not ff:
+        raise FileNotFoundError(
+            "ffmpeg was not found. Install ffmpeg or use the bundled build.")
+    _ext, args = CONVERT_TARGETS[fmt_label]
+    cmd = [ff, "-y", "-i", src, *args, dest]
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=3600,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    if on_stderr and proc.stderr:
+        on_stderr(proc.stderr[-500:])
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "ffmpeg failed").strip()
+        # Keep the useful tail — ffmpeg dumps are long.
+        raise RuntimeError(err[-800:] if len(err) > 800 else err)
+    if not os.path.isfile(dest) or os.path.getsize(dest) == 0:
+        raise RuntimeError("Conversion finished but the output file is missing or empty.")
 
 
 def parse_version(v: str) -> tuple:
@@ -582,6 +700,8 @@ class DownloaderApp:
         self.sound_var.trace_add("write", lambda *_: self._persist())
 
         self.log_history: list[tuple[str, bool]] = []
+        self.download_history: list = load_history()
+        self._history_win = None
         self._update_checked = False
 
         # Discord Rich Presence (shows the app as a game activity).
@@ -660,6 +780,8 @@ class DownloaderApp:
         return [
             ("File", [
                 ("command", "Open save folder", self._open_folder),
+                ("command", "Download history\u2026", self._open_history),
+                ("command", "Convert file\u2026", lambda: self._open_convert_dialog()),
                 ("sep",),
                 ("command", "Exit", self._on_close),
             ]),
@@ -726,7 +848,8 @@ class DownloaderApp:
         self._alert(
             "About " + APP_TITLE,
             APP_TITLE + " by TheMannster\n\nDownloads TikTok, Instagram Reels, Facebook Reels, "
-            "and YouTube Shorts.\n\nPowered by yt-dlp.",
+            "and YouTube Shorts.\nConvert downloads (or any media file) to other formats.\n\n"
+            "Powered by yt-dlp + ffmpeg.",
             kind="info",
         )
 
@@ -947,6 +1070,361 @@ class DownloaderApp:
         y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
         win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
+    # ------------------------------------------------ History / Convert
+    def _record_history(self, title: str, path: str, url: str = "", quality: str = ""):
+        if not path:
+            return
+        self.download_history = history_add(
+            self.download_history,
+            title=title,
+            path=path,
+            url=url,
+            platform=detect_platform(url) if url else "",
+            quality=quality,
+        )
+        if self._history_win and self._history_win.winfo_exists():
+            self._refresh_history_list()
+
+    def _history_selected(self):
+        if not hasattr(self, "_history_list"):
+            return None
+        sel = self._history_list.curselection()
+        if not sel:
+            return None
+        idx = sel[0]
+        if 0 <= idx < len(self.download_history):
+            return self.download_history[idx]
+        return None
+
+    def _refresh_history_list(self):
+        if not hasattr(self, "_history_list"):
+            return
+        self._history_list.delete(0, "end")
+        for entry in self.download_history:
+            path = entry.get("path") or ""
+            exists = os.path.isfile(path)
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.get("ts") or 0))
+            mark = "" if exists else " [missing]"
+            platform = entry.get("platform") or ""
+            prefix = f"[{platform}] " if platform else ""
+            title = entry.get("title") or os.path.basename(path) or "(untitled)"
+            self._history_list.insert("end", f"{when}  {prefix}{title}{mark}")
+
+    def _open_history(self):
+        if self._history_win and self._history_win.winfo_exists():
+            self._history_win.lift()
+            self._history_win.focus_force()
+            self._refresh_history_list()
+            return
+
+        retro = self.theme == THEME_RETRO
+        bg = FACE if retro else BG_LEGACY
+        fg = "#000000" if retro else TEXT_LEGACY
+        subfg = "#333333" if retro else SUBTEXT_LEGACY
+        surface = LIGHT if retro else SURFACE_LEGACY
+        header_font = WIN95_FONT_BOLD if retro else ("Segoe UI Semibold", 12)
+        body_font = WIN95_FONT if retro else UI_FONT
+
+        win = tk.Toplevel(self.root)
+        self._history_win = win
+        win.title("Download history")
+        win.transient(self.root)
+        win.configure(bg=bg)
+        win.minsize(520, 360)
+
+        pad = tk.Frame(win, bg=bg)
+        pad.pack(fill="both", expand=True, padx=16, pady=14)
+        tk.Label(pad, text="Download history", bg=bg, fg=fg, font=header_font).pack(anchor="w")
+        tk.Label(
+            pad,
+            text="Open past downloads or convert them to another format.",
+            bg=bg, fg=subfg, font=body_font,
+        ).pack(anchor="w", pady=(2, 10))
+
+        list_wrap = tk.Frame(pad, bg=bg)
+        list_wrap.pack(fill="both", expand=True)
+        scroll = tk.Scrollbar(list_wrap)
+        scroll.pack(side="right", fill="y")
+        self._history_list = tk.Listbox(
+            list_wrap, font=body_font, bg=surface, fg=fg,
+            selectbackground=NAVY if retro else PRIMARY,
+            selectforeground="#ffffff",
+            relief="sunken" if retro else "flat",
+            bd=2 if retro else 0, highlightthickness=1 if not retro else 0,
+            highlightbackground=BORDER_LEGACY, activestyle="none",
+            yscrollcommand=scroll.set,
+        )
+        self._history_list.pack(side="left", fill="both", expand=True)
+        scroll.config(command=self._history_list.yview)
+        self._history_list.bind("<Double-Button-1>", lambda _e: self._history_open_file())
+
+        btn_row = tk.Frame(pad, bg=bg)
+        btn_row.pack(fill="x", pady=(12, 0))
+
+        actions = [
+            ("Open", self._history_open_file),
+            ("Show", self._history_show_file),
+            ("Convert", self._history_convert),
+            ("Remove", self._history_remove),
+            ("Clear all", self._history_clear),
+            ("Convert any\u2026", lambda: self._open_convert_dialog()),
+        ]
+        for label, cmd in actions:
+            if retro:
+                b = make_button(btn_row, label, cmd, width=11)
+            else:
+                kind = "accent" if label == "Convert" else "ghost"
+                b = mk_button(btn_row, label, cmd, kind=kind)
+            b.pack(side="left", padx=(0, 6))
+        if retro:
+            make_button(btn_row, "Close", win.destroy, width=8).pack(side="right")
+        else:
+            mk_button(btn_row, "Close", win.destroy).pack(side="right")
+
+        def on_close():
+            self._history_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self._refresh_history_list()
+        win.update_idletasks()
+        set_dark_titlebar(win, not retro)
+        w, h = max(win.winfo_reqwidth(), 560), max(win.winfo_reqheight(), 400)
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
+        win.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+
+    def _history_open_file(self):
+        entry = self._history_selected()
+        if not entry:
+            self._notify("Select a history item first.", "warning")
+            return
+        path = entry.get("path") or ""
+        if os.path.isfile(path):
+            self._os_open(path)
+        else:
+            self._notify("That file is no longer on disk.", "warning")
+
+    def _history_show_file(self):
+        entry = self._history_selected()
+        if not entry:
+            self._notify("Select a history item first.", "warning")
+            return
+        path = entry.get("path") or ""
+        if os.path.isfile(path):
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            else:
+                self._os_open(os.path.dirname(path))
+        elif os.path.isdir(os.path.dirname(path)):
+            self._os_open(os.path.dirname(path))
+        else:
+            self._notify("That file is no longer on disk.", "warning")
+
+    def _history_convert(self):
+        entry = self._history_selected()
+        if not entry:
+            self._notify("Select a history item first.", "warning")
+            return
+        path = entry.get("path") or ""
+        if not os.path.isfile(path):
+            self._notify("That file is no longer on disk.", "warning")
+            return
+        self._open_convert_dialog(path)
+
+    def _history_remove(self):
+        entry = self._history_selected()
+        if not entry:
+            self._notify("Select a history item first.", "warning")
+            return
+        eid = entry.get("id")
+        self.download_history = [e for e in self.download_history if e.get("id") != eid]
+        save_history(self.download_history)
+        self._refresh_history_list()
+
+    def _history_clear(self):
+        if not self.download_history:
+            return
+        if not self._confirm("Clear history", "Remove all items from download history?\n"
+                             "(This does not delete the files.)", kind="warning"):
+            return
+        self.download_history = []
+        save_history(self.download_history)
+        self._refresh_history_list()
+
+    def _open_convert_dialog(self, src_path: str | None = None):
+        if self.is_downloading or self.is_busy:
+            self._notify("Please wait for the current task to finish.", "info")
+            return
+        if not ffmpeg_executable():
+            self._alert(
+                APP_TITLE,
+                "ffmpeg was not found, so conversion isn't available.\n\n"
+                "Place ffmpeg next to the app (or in vendor\\ffmpeg) and try again.",
+                kind="error",
+            )
+            return
+
+        retro = self.theme == THEME_RETRO
+        bg = FACE if retro else BG_LEGACY
+        fg = "#000000" if retro else TEXT_LEGACY
+        subfg = "#333333" if retro else SUBTEXT_LEGACY
+        header_font = WIN95_FONT_BOLD if retro else ("Segoe UI Semibold", 12)
+        body_font = WIN95_FONT if retro else UI_FONT
+
+        initial = src_path or self.last_file or ""
+        if initial and not os.path.isfile(initial):
+            initial = ""
+
+        win = tk.Toplevel(self.root)
+        win.title("Convert file")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.configure(bg=bg)
+        win.grab_set()
+
+        src_var = tk.StringVar(value=initial)
+        fmt_var = tk.StringVar(value="MP3 (audio)")
+        out_var = tk.StringVar()
+
+        def sync_output(*_):
+            src = src_var.get().strip()
+            label = fmt_var.get()
+            if src and label in CONVERT_TARGETS:
+                ext, _ = CONVERT_TARGETS[label]
+                out_var.set(default_convert_output(src, ext))
+            elif not src:
+                out_var.set("")
+
+        src_var.trace_add("write", sync_output)
+        fmt_var.trace_add("write", sync_output)
+        sync_output()
+
+        pad = tk.Frame(win, bg=bg)
+        pad.pack(fill="both", expand=True, padx=18, pady=16)
+        tk.Label(pad, text="Convert file", bg=bg, fg=fg, font=header_font).pack(anchor="w")
+        tk.Label(
+            pad, text="Pick a video or audio file and a target format.",
+            bg=bg, fg=subfg, font=body_font,
+        ).pack(anchor="w", pady=(2, 12))
+
+        tk.Label(pad, text="Source", bg=bg, fg=fg, font=body_font).pack(anchor="w")
+        src_row = tk.Frame(pad, bg=bg)
+        src_row.pack(fill="x", pady=(4, 10))
+        if retro:
+            make_entry(src_row, src_var).pack(side="left", fill="x", expand=True, ipady=3, padx=(0, 6))
+            make_button(src_row, "Browse", lambda: browse_src(), width=8).pack(side="left")
+        else:
+            wrap, _ = mk_entry(src_row, src_var, font=UI_FONT)
+            wrap.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            mk_button(src_row, "Browse", lambda: browse_src()).pack(side="left")
+
+        def browse_src():
+            path = filedialog.askopenfilename(
+                title="Choose a file to convert",
+                initialdir=os.path.dirname(src_var.get()) or self.folder_var.get() or DEFAULT_DOWNLOAD_DIR,
+                filetypes=MEDIA_FILETYPES,
+            )
+            if path:
+                src_var.set(path)
+
+        tk.Label(pad, text="Format", bg=bg, fg=fg, font=body_font).pack(anchor="w")
+        fmt_row = tk.Frame(pad, bg=bg)
+        fmt_row.pack(fill="x", pady=(4, 10))
+        labels = list(CONVERT_TARGETS.keys())
+        if retro:
+            menu = tk.OptionMenu(fmt_row, fmt_var, *labels)
+            menu.config(font=WIN95_FONT, bg=FACE, fg="#000000", activebackground=FACE,
+                        relief="raised", bd=2, highlightthickness=1,
+                        highlightbackground=DARKEDGE, width=22, anchor="w")
+            menu["menu"].config(bg=FACE, fg="#000000", font=WIN95_FONT)
+            menu.pack(anchor="w")
+        else:
+            mk_dropdown(fmt_row, fmt_var, labels, width=24).pack(anchor="w")
+
+        tk.Label(pad, text="Output", bg=bg, fg=fg, font=body_font).pack(anchor="w")
+        out_row = tk.Frame(pad, bg=bg)
+        out_row.pack(fill="x", pady=(4, 14))
+        if retro:
+            make_entry(out_row, out_var).pack(side="left", fill="x", expand=True, ipady=3, padx=(0, 6))
+            make_button(out_row, "Browse", lambda: browse_out(), width=8).pack(side="left")
+        else:
+            owrap, _ = mk_entry(out_row, out_var, font=UI_FONT)
+            owrap.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            mk_button(out_row, "Browse", lambda: browse_out()).pack(side="left")
+
+        def browse_out():
+            label = fmt_var.get()
+            ext = CONVERT_TARGETS.get(label, ("mp4", None))[0]
+            path = filedialog.asksaveasfilename(
+                title="Save converted file as",
+                initialfile=os.path.basename(out_var.get() or f"converted.{ext}"),
+                initialdir=os.path.dirname(out_var.get() or src_var.get() or "") or DEFAULT_DOWNLOAD_DIR,
+                defaultextension=f".{ext}",
+                filetypes=[(f".{ext}", f"*.{ext}"), ("All files", "*.*")],
+            )
+            if path:
+                out_var.set(path)
+
+        btn_row = tk.Frame(pad, bg=bg)
+        btn_row.pack(fill="x")
+
+        def start():
+            src = src_var.get().strip()
+            dest = out_var.get().strip()
+            label = fmt_var.get()
+            if not src or not os.path.isfile(src):
+                self._notify("Choose a valid source file.", "warning")
+                return
+            if not dest:
+                self._notify("Choose an output path.", "warning")
+                return
+            if label not in CONVERT_TARGETS:
+                self._notify("Choose a target format.", "warning")
+                return
+            if os.path.normcase(os.path.normpath(src)) == os.path.normcase(os.path.normpath(dest)):
+                self._notify("Output must be a different file than the source.", "warning")
+                return
+            win.destroy()
+            self._start_convert(src, dest, label)
+
+        if retro:
+            make_button(btn_row, "Convert", start, bold=True, width=10).pack(side="right", padx=(6, 0))
+            make_button(btn_row, "Cancel", win.destroy, width=8).pack(side="right")
+        else:
+            mk_button(btn_row, "Convert", start, kind="accent").pack(side="right", padx=(6, 0))
+            mk_button(btn_row, "Cancel", win.destroy).pack(side="right")
+
+        win.update_idletasks()
+        set_dark_titlebar(win, not retro)
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _start_convert(self, src: str, dest: str, fmt_label: str):
+        if self.is_downloading or self.is_busy:
+            self._notify("Please wait for the current task to finish.", "info")
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+        self.is_busy = True
+        self._update_action_buttons()
+        self.progress.set(0)
+        self.status_var.set("Converting...")
+        self._log(f"Converting to {fmt_label}: {os.path.basename(src)}")
+        threading.Thread(
+            target=self._convert_worker, args=(src, dest, fmt_label), daemon=True
+        ).start()
+
+    def _convert_worker(self, src: str, dest: str, fmt_label: str):
+        try:
+            self.msg_queue.put(("progress", 15, "Converting with ffmpeg..."))
+            run_ffmpeg_convert(src, dest, fmt_label)
+            title = os.path.basename(dest)
+            self.msg_queue.put(("convert_done", title, dest, fmt_label))
+        except Exception as exc:  # noqa: BLE001
+            self.msg_queue.put(("convert_error", str(exc)))
+
     # ------------------------------------------------------- Retro UI build
     def _build_retro_ui(self):
         outer = tk.Frame(self.root, bg=FACE, bd=0)
@@ -1025,7 +1503,11 @@ class DownloaderApp:
         self.open_file_btn = make_button(done_row, "Open file", self._open_last_file, width=10)
         self.open_file_btn.pack(side="left", padx=(0, 4))
         self.show_folder_btn = make_button(done_row, "Show in folder", self._show_in_folder, width=13)
-        self.show_folder_btn.pack(side="left")
+        self.show_folder_btn.pack(side="left", padx=(0, 4))
+        self.history_btn = make_button(done_row, "History", self._open_history, width=8)
+        self.history_btn.pack(side="left", padx=(0, 4))
+        self.convert_btn = make_button(done_row, "Convert", lambda: self._open_convert_dialog(), width=8)
+        self.convert_btn.pack(side="left")
 
         log_group = make_group(outer, " Log ")
         log_group.pack(fill="both", expand=True, pady=6)
@@ -1162,7 +1644,11 @@ class DownloaderApp:
         self.open_file_btn = mk_button(done_row, "Open file", self._open_last_file)
         self.open_file_btn.pack(side="left", padx=(0, 6))
         self.show_folder_btn = mk_button(done_row, "Show in folder", self._show_in_folder)
-        self.show_folder_btn.pack(side="left")
+        self.show_folder_btn.pack(side="left", padx=(0, 6))
+        self.history_btn = mk_button(done_row, "History", self._open_history)
+        self.history_btn.pack(side="left", padx=(0, 6))
+        self.convert_btn = mk_button(done_row, "Convert", lambda: self._open_convert_dialog())
+        self.convert_btn.pack(side="left")
 
         # --- Log --------------------------------------------------------
         mk_caption(c, "Log", BG_LEGACY).pack(anchor="w", pady=(0, 6))
@@ -1293,6 +1779,10 @@ class DownloaderApp:
         can_start = not self.is_downloading and not self.is_busy
         self._set_enabled(self.download_btn, can_start)
         self._set_enabled(self.preview_btn, can_start)
+        if hasattr(self, "convert_btn"):
+            self._set_enabled(self.convert_btn, can_start)
+        if hasattr(self, "history_btn"):
+            self._set_enabled(self.history_btn, True)
 
     # -------------------------------------------------------------- Preview
     def _start_preview(self):
@@ -1448,7 +1938,7 @@ class DownloaderApp:
                 if audio_only and filepath:
                     filepath = os.path.splitext(filepath)[0] + ".mp3"
                 title = info.get("title", "video")
-            self.msg_queue.put(("done", title, filepath))
+            self.msg_queue.put(("done", title, filepath, url, quality))
         except DownloadCancelled:
             self.msg_queue.put(("cancelled",))
         except Exception as exc:  # noqa: BLE001
@@ -1499,9 +1989,9 @@ class DownloaderApp:
 
     def _handle_update_check(self, tag, portable_url, installer_url, manual):
         if not (tag and is_newer_version(tag, APP_VERSION)):
-            self.status_var.set(f"You're up to date (v{APP_VERSION}).")
+            self.status_var.set("You're up to date.")
             if manual:
-                self._notify(f"You're on the latest version (v{APP_VERSION}).", "success")
+                self._notify("You're on the latest version.", "success")
             return
 
         if manual:
@@ -1667,11 +2157,16 @@ class DownloaderApp:
                     self.progress.set(pct)
                     self.status_var.set(status)
                 elif kind == "done":
-                    _, title, filepath = msg
+                    # msg: done, title, filepath[, url, quality]
+                    title = msg[1]
+                    filepath = msg[2]
+                    url = msg[3] if len(msg) > 3 else ""
+                    quality = msg[4] if len(msg) > 4 else ""
                     self.last_file = filepath
                     self.progress.set(100)
                     self.status_var.set("Done!")
                     self._log(f"Saved: {title}")
+                    self._record_history(title, filepath, url=url, quality=quality)
                     self._finish()
                     self._notify(f"Download complete!\n{title}", "success")
                 elif kind == "cancelled":
@@ -1685,6 +2180,26 @@ class DownloaderApp:
                     self._log(err, error=True)
                     self._finish()
                     self._notify(f"Download failed:\n{err}", "error", duration=6000)
+                elif kind == "convert_done":
+                    _, title, filepath, fmt_label = msg
+                    self.last_file = filepath
+                    self.progress.set(100)
+                    self.is_busy = False
+                    self.status_var.set("Conversion done!")
+                    self._log(f"Converted ({fmt_label}): {title}")
+                    self._record_history(title, filepath, quality=f"Converted → {fmt_label}")
+                    self._update_action_buttons()
+                    self.discord.set_idle()
+                    self._notify(f"Converted!\n{title}", "success")
+                elif kind == "convert_error":
+                    _, err = msg
+                    self.is_busy = False
+                    self.progress.set(0)
+                    self.status_var.set("Conversion failed.")
+                    self._log("Convert failed: " + err, error=True)
+                    self._update_action_buttons()
+                    self.discord.set_idle()
+                    self._notify(f"Conversion failed:\n{err}", "error", duration=7000)
                 elif kind == "preview":
                     _, meta, img = msg
                     self.is_busy = False

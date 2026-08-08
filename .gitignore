@@ -15,6 +15,7 @@ __pycache__/
 
 # ---- Local app data / test output ----
 settings.json
+history.json
 downloads/
 
 # ---- OS / editor cruft ----
