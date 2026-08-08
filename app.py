@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 HISTORY_MAX = 100
@@ -2102,62 +2102,83 @@ class DownloaderApp:
             "Restart TM Ripper now to finish?",
             kind="success",
         ):
-            try:
-                subprocess.Popen([exe], cwd=os.path.dirname(exe))
-            except Exception:
-                pass
-            self.root.after(300, self._on_close)
+            # Must wait until THIS process exits before launching the new exe.
+            # Starting it while we're still alive causes PyInstaller DLL load failures.
+            self._spawn_after_exit(exe, kill_other_instances=False)
         else:
             self._notify("Update will be applied next time you open TM Ripper.", "info")
 
-    def _launch_installer_and_quit(self, path: str):
-        """Quit first, then start Setup so its AppMutex/file locks aren't stuck on us."""
-        self._log("Closing so the installer can update...")
+    def _ps_quote(self, path: str) -> str:
+        """Single-quote a path for PowerShell (-Command)."""
+        return "'" + path.replace("'", "''") + "'"
+
+    def _spawn_after_exit(self, target: str, *, args: list[str] | None = None,
+                          kill_other_instances: bool = False, settle_ms: int = 1200):
+        """Quit this process, then start target once our PID is fully gone.
+
+        Avoids installer mutex loops and PyInstaller "DLL failed to load" errors
+        from relaunching while the old process is still tearing down.
+        """
         self._persist()
         try:
             self.discord.close()
         except Exception:
             pass
 
-        setup = os.path.normpath(path)
-        if not os.path.isfile(setup):
-            self._alert(APP_TITLE, f"Installer not found:\n{setup}", kind="error")
+        target = os.path.normpath(target)
+        if not os.path.isfile(target):
+            self._alert(APP_TITLE, f"Could not find:\n{target}", kind="error")
             self.is_busy = False
             self._update_action_buttons()
             return
 
         pid = os.getpid()
-        # Wait until THIS process is gone, force-kill any leftover TM Ripper
-        # copies, then launch Setup. Avoids the "please close TM Ripper" loop.
+        arg_list = args or []
+        arg_ps = ",".join(self._ps_quote(a) for a in arg_list)
+        start_args = f"-ArgumentList @({arg_ps}) " if arg_ps else ""
+        kill_ps = (
+            "Get-Process -Name 'TM Ripper' -EA SilentlyContinue | "
+            "Stop-Process -Force -EA SilentlyContinue; Start-Sleep -m 300; "
+            if kill_other_instances else ""
+        )
+        # Wait for us to die, settle (temp/_MEI cleanup + AV), optional kill, then start.
         ps = (
             f"$p={pid};"
             f"while(Get-Process -Id $p -EA SilentlyContinue){{Start-Sleep -m 200}};"
-            f"Start-Sleep -m 400;"
-            f"Get-Process -Name 'TM Ripper' -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue;"
-            f"Start-Sleep -m 300;"
-            f"Start-Process -FilePath '{setup.replace(chr(39), chr(39)+chr(39))}' "
-            f"-ArgumentList '/FORCECLOSEAPPLICATIONS'"
+            f"Start-Sleep -m {int(settle_ms)};"
+            f"{kill_ps}"
+            f"Start-Process -FilePath {self._ps_quote(target)} {start_args}"
+            f"-WorkingDirectory {self._ps_quote(os.path.dirname(target) or '.')}"
         )
         try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             subprocess.Popen(
                 ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
                 close_fds=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                creationflags=flags,
             )
         except Exception as exc:  # noqa: BLE001
-            self._alert(APP_TITLE, f"Could not launch installer:\n{exc}", kind="error")
+            self._alert(APP_TITLE, f"Could not schedule relaunch:\n{exc}", kind="error")
             self.is_busy = False
             self._update_action_buttons()
             return
 
         release_app_mutex()
-        # Hard-exit so daemon threads (Discord, etc.) can't keep the process alive
-        # and block the installer.
         try:
             self.root.destroy()
         except Exception:
             pass
         os._exit(0)
+
+    def _launch_installer_and_quit(self, path: str):
+        """Quit first, then start Setup so its AppMutex/file locks aren't stuck on us."""
+        self._log("Closing so the installer can update...")
+        self._spawn_after_exit(
+            path,
+            args=["/FORCECLOSEAPPLICATIONS"],
+            kill_other_instances=True,
+            settle_ms=700,
+        )
 
     # ----------------------------------------------------- Update yt-dlp
     def _update_downloader(self):
