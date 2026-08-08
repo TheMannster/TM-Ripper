@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 HISTORY_MAX = 100
@@ -2111,15 +2111,53 @@ class DownloaderApp:
             self._notify("Update will be applied next time you open TM Ripper.", "info")
 
     def _launch_installer_and_quit(self, path: str):
-        self._log("Launching installer; the app will close to finish updating.")
+        """Quit first, then start Setup so its AppMutex/file locks aren't stuck on us."""
+        self._log("Closing so the installer can update...")
+        self._persist()
         try:
-            self._os_open(path)
+            self.discord.close()
+        except Exception:
+            pass
+
+        setup = os.path.normpath(path)
+        if not os.path.isfile(setup):
+            self._alert(APP_TITLE, f"Installer not found:\n{setup}", kind="error")
+            self.is_busy = False
+            self._update_action_buttons()
+            return
+
+        pid = os.getpid()
+        # Wait until THIS process is gone, force-kill any leftover TM Ripper
+        # copies, then launch Setup. Avoids the "please close TM Ripper" loop.
+        ps = (
+            f"$p={pid};"
+            f"while(Get-Process -Id $p -EA SilentlyContinue){{Start-Sleep -m 200}};"
+            f"Start-Sleep -m 400;"
+            f"Get-Process -Name 'TM Ripper' -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue;"
+            f"Start-Sleep -m 300;"
+            f"Start-Process -FilePath '{setup.replace(chr(39), chr(39)+chr(39))}' "
+            f"-ArgumentList '/FORCECLOSEAPPLICATIONS'"
+        )
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                close_fds=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
         except Exception as exc:  # noqa: BLE001
             self._alert(APP_TITLE, f"Could not launch installer:\n{exc}", kind="error")
             self.is_busy = False
             self._update_action_buttons()
             return
-        self.root.after(600, self.root.destroy)
+
+        release_app_mutex()
+        # Hard-exit so daemon threads (Discord, etc.) can't keep the process alive
+        # and block the installer.
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
 
     # ----------------------------------------------------- Update yt-dlp
     def _update_downloader(self):
@@ -2260,15 +2298,36 @@ class DownloaderApp:
         self.discord.set_idle()
 
 
+_APP_MUTEX_HANDLE = None
+
+
 def _create_app_mutex():
     """Named mutex so the installer's AppMutex can detect a running copy."""
-    if sys.platform == "win32":
-        try:
-            import ctypes
+    global _APP_MUTEX_HANDLE
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
 
-            ctypes.windll.kernel32.CreateMutexW(None, False, "TMRipperRunningMutex")
-        except Exception:
-            pass
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, "TMRipperRunningMutex")
+        if handle:
+            _APP_MUTEX_HANDLE = handle
+    except Exception:
+        pass
+
+
+def release_app_mutex():
+    """Drop the installer mutex early so Setup isn't stuck waiting on us."""
+    global _APP_MUTEX_HANDLE
+    if sys.platform != "win32" or not _APP_MUTEX_HANDLE:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.CloseHandle(_APP_MUTEX_HANDLE)
+    except Exception:
+        pass
+    _APP_MUTEX_HANDLE = None
 
 
 def _enable_dpi_awareness():

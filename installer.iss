@@ -5,7 +5,7 @@
 ; Compile with:  ISCC installer.iss   (or run build_installer.bat)
 
 #define MyAppName "TM Ripper"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyAppPublisher "TheMannster"
 #define MyAppExeName "TM Ripper.exe"
 
@@ -27,10 +27,11 @@ WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Install per-user by default so no admin prompt is required.
 PrivilegesRequiredOverridesAllowed=dialog
-; Auto-close a running copy during updates so files can be replaced.
-CloseApplications=yes
+; Force-close a running copy during updates so files can be replaced.
+; (Do not use AppMutex — it only shows a Retry loop and cannot kill the app,
+; which strand users when Setup is launched from inside TM Ripper.)
+CloseApplications=force
 CloseApplicationsFilter=*.exe
-AppMutex=TMRipperRunningMutex
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -51,3 +52,33 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function KillRunningApp: Boolean;
+var
+  ResultCode: Integer;
+begin
+  { Force-close every running copy so file replaces never get stuck. }
+  Exec('taskkill.exe', '/F /IM "TM Ripper.exe" /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill.exe', '/F /IM "TM Ripper.old.exe" /T', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(400);
+  Result := True;
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  KillRunningApp();
+  Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  KillRunningApp();
+  Result := '';
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    KillRunningApp();
+end;
