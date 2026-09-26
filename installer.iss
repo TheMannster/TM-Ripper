@@ -5,7 +5,7 @@
 ; Compile with:  ISCC installer.iss   (or run build_installer.bat)
 
 #define MyAppName "TM Ripper"
-#define MyAppVersion "1.2.3"
+#define MyAppVersion "1.2.4"
 #define MyAppPublisher "TheMannster"
 #define MyAppExeName "TM Ripper.exe"
 
@@ -51,7 +51,9 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; Detach with `start` so Setup exiting cannot tear down PyInstaller's _MEI
+; folder and leave the new app unable to load python314.dll.
+Filename: "{cmd}"; Parameters: "/c start """" ""{app}\{#MyAppExeName}"""; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runhidden
 
 [Code]
 function KillRunningApp: Boolean;

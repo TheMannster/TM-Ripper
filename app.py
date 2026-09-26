@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 HISTORY_MAX = 100
@@ -2123,20 +2123,6 @@ class DownloaderApp:
         except Exception as exc:  # noqa: BLE001
             self.msg_queue.put(("update_check_err", str(exc), manual))
 
-    def _install_dir_writable(self):
-        """True if we can swap the running exe in place (no admin needed)."""
-        if not getattr(sys, "frozen", False):
-            return False
-        try:
-            folder = os.path.dirname(sys.executable)
-            probe = os.path.join(folder, ".tmr_write_test")
-            with open(probe, "w") as fh:
-                fh.write("ok")
-            os.remove(probe)
-            return True
-        except OSError:
-            return False
-
     def _handle_update_check(self, tag, portable_url, installer_url, manual):
         if not (tag and is_newer_version(tag, APP_VERSION)):
             self.status_var.set("You're up to date.")
@@ -2147,7 +2133,10 @@ class DownloaderApp:
         if manual:
             self.status_var.set("Update available.")
 
-        can_swap = bool(portable_url) and self._install_dir_writable()
+        # Prefer the portable zip. It downloads while this window stays open,
+        # then the app closes and reopens. The installer is only a fallback
+        # when that package is missing.
+        can_swap = bool(portable_url) and preferred_install_dir() is not None
         if not can_swap and not installer_url:
             self._alert(
                 APP_TITLE,
@@ -2157,7 +2146,8 @@ class DownloaderApp:
             )
             return
 
-        detail = ("It will download in the background, then ask you to reopen the app."
+        detail = ("It will download in the background, then close and reopen "
+                  "on the new version."
                   if can_swap else
                   "This will download and run the installer.")
         if not self._confirm(
@@ -2206,24 +2196,38 @@ class DownloaderApp:
             self.msg_queue.put(("update_err", str(exc)))
 
     def _apply_exe_update(self, zip_path: str):
-        """Extract the portable build and swap it in place; no installer needed."""
-        exe = sys.executable
-        folder = os.path.dirname(exe)
-        new_exe = os.path.join(folder, "TM Ripper.new.exe")
-        old = exe + ".old"
+        """Extract the portable build and swap it in, then reopen. No installer."""
+        folder = preferred_install_dir()
+        if not folder:
+            self._log("No writable folder for the update.", error=True)
+            self.is_busy = False
+            self._update_action_buttons()
+            self._alert(APP_TITLE, "Couldn't find a folder the update can be saved to.", kind="error")
+            return
+        os.makedirs(folder, exist_ok=True)
+        staging = os.path.join(folder, "TM Ripper.new.exe")
+        target = os.path.join(folder, "TM Ripper.exe")
+        running = os.path.normcase(os.path.normpath(sys.executable)) if getattr(sys, "frozen", False) else ""
+        replacing_self = os.path.normcase(os.path.normpath(target)) == running
         try:
             with zipfile.ZipFile(zip_path) as z:
                 inner = next((n for n in z.namelist() if n.lower().endswith(".exe")), None)
                 if not inner:
                     raise OSError("No application found inside the update package.")
-                with z.open(inner) as src, open(new_exe, "wb") as dst:
+                with z.open(inner) as src, open(staging, "wb") as dst:
                     shutil.copyfileobj(src, dst)
-            if os.path.exists(old):
-                os.remove(old)
-            os.rename(exe, old)          # move the running exe aside (allowed on Windows)
-            os.rename(new_exe, exe)      # put the new build in its place
+            copy_runtime_sidecars(os.path.dirname(sys.executable), folder)
+            if replacing_self:
+                old = target + ".old"
+                if os.path.exists(old):
+                    os.remove(old)
+                os.rename(target, old)       # running exe can be renamed on Windows
+                os.rename(staging, target)
+            else:
+                os.replace(staging, target)
+                retarget_shortcuts(target)
         except OSError as exc:
-            for leftover in (new_exe,):
+            for leftover in (staging,):
                 try:
                     if os.path.exists(leftover):
                         os.remove(leftover)
@@ -2241,22 +2245,12 @@ class DownloaderApp:
             except OSError:
                 pass
 
-        self.is_busy = False
-        self._update_action_buttons()
         self.progress.set(100)
-        self.status_var.set("Update ready \u2013 restart to finish.")
-        self._log("Update downloaded. Restart to finish updating.")
-        if self._confirm(
-            "Update ready",
-            "The update was downloaded and installed.\n\n"
-            "Restart TM Ripper now to finish?",
-            kind="success",
-        ):
-            # Must wait until THIS process exits before launching the new exe.
-            # Starting it while we're still alive causes PyInstaller DLL load failures.
-            self._spawn_after_exit(exe, kill_other_instances=False)
-        else:
-            self._notify("Update will be applied next time you open TM Ripper.", "info")
+        self.status_var.set("Restarting to finish the update...")
+        self._log("Update downloaded. Closing to reopen the new version.")
+        # Must wait until THIS process exits before launching the new exe.
+        # Starting it while we're still alive causes PyInstaller DLL load failures.
+        self._spawn_after_exit(target, kill_other_instances=False, settle_ms=2500)
 
     def _ps_quote(self, path: str) -> str:
         """Single-quote a path for PowerShell (-Command)."""
@@ -2291,10 +2285,16 @@ class DownloaderApp:
             "Stop-Process -Force -EA SilentlyContinue; Start-Sleep -m 300; "
             if kill_other_instances else ""
         )
-        # Wait for us to die, settle (temp/_MEI cleanup + AV), optional kill, then start.
+        # Wait until this process and every TM Ripper copy are gone so the
+        # PyInstaller _MEI folder is deleted before the new exe creates its own.
         ps = (
             f"$p={pid};"
-            f"while(Get-Process -Id $p -EA SilentlyContinue){{Start-Sleep -m 200}};"
+            f"$deadline=(Get-Date).AddSeconds(30);"
+            f"while((Get-Date) -lt $deadline -and (Get-Process -Id $p -EA SilentlyContinue))"
+            f"{{Start-Sleep -m 200}};"
+            f"while((Get-Date) -lt $deadline -and "
+            f"(Get-Process -Name 'TM Ripper','TM Ripper.new','TM Ripper.old' -EA SilentlyContinue))"
+            f"{{Start-Sleep -m 200}};"
             f"Start-Sleep -m {int(settle_ms)};"
             f"{kill_ps}"
             f"Start-Process -FilePath {self._ps_quote(target)} {start_args}"
@@ -2561,8 +2561,147 @@ def _cleanup_old_update():
             pass
 
 
+def user_install_dir() -> str:
+    """A per-user folder the app can replace itself in, without admin."""
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(local, "Programs", "TM Ripper")
+
+
+def dir_writable(folder: str) -> bool:
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".tmr_write_test")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def preferred_install_dir() -> str | None:
+    """Where an update should be written.
+
+    The running install folder when this user can replace the exe there,
+    otherwise the per-user Programs folder.
+    """
+    if getattr(sys, "frozen", False):
+        current = os.path.dirname(os.path.normpath(sys.executable))
+        if dir_writable(current):
+            return current
+    fallback = user_install_dir()
+    if dir_writable(fallback):
+        return fallback
+    return None
+
+
+def copy_runtime_sidecars(src_dir: str, dest_dir: str):
+    """Keep ffmpeg next to the exe when an update moves to a new folder."""
+    if not src_dir or os.path.normcase(src_dir) == os.path.normcase(dest_dir):
+        return
+    for name in ("ffmpeg.exe", "ffprobe.exe"):
+        src = os.path.join(src_dir, name)
+        dst = os.path.join(dest_dir, name)
+        if os.path.isfile(src) and not os.path.isfile(dst):
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                pass
+
+
+def retarget_shortcuts(new_exe: str):
+    """Point desktop and Start Menu shortcuts at new_exe."""
+    if sys.platform != "win32":
+        return
+    ps = (
+        "$new = " + "'" + new_exe.replace("'", "''") + "';"
+        "$dir = Split-Path $new;"
+        "$shell = New-Object -ComObject WScript.Shell;"
+        "$roots = @("
+        "[Environment]::GetFolderPath('Desktop'),"
+        "[Environment]::GetFolderPath('Programs'),"
+        "[Environment]::GetFolderPath('CommonDesktopDirectory'),"
+        "[Environment]::GetFolderPath('CommonPrograms')"
+        ");"
+        "foreach ($root in $roots) {"
+        "  if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue };"
+        "  Get-ChildItem -LiteralPath $root -Filter *.lnk -Recurse -EA SilentlyContinue | "
+        "  ForEach-Object {"
+        "    try {"
+        "      $sc = $shell.CreateShortcut($_.FullName);"
+        "      if ($sc.TargetPath -like '*TM Ripper.exe') {"
+        "        $sc.TargetPath = $new; $sc.WorkingDirectory = $dir; $sc.Save()"
+        "      }"
+        "    } catch {}"
+        "  }"
+        "}"
+    )
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+            capture_output=True, timeout=20, creationflags=flags,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def relocate_unwritable_install() -> bool:
+    """Copy a Program Files install into the user folder and reopen it.
+
+    Returns True when this process has scheduled that relaunch and should exit.
+    """
+    if not getattr(sys, "frozen", False) or sys.platform != "win32":
+        return False
+    current = os.path.normpath(sys.executable)
+    current_dir = os.path.dirname(current)
+    if dir_writable(current_dir):
+        return False
+    dest_dir = user_install_dir()
+    if os.path.normcase(dest_dir) == os.path.normcase(current_dir) or not dir_writable(dest_dir):
+        return False
+    dest = os.path.join(dest_dir, "TM Ripper.exe")
+    try:
+        needs_copy = (
+            not os.path.isfile(dest)
+            or os.path.getsize(current) != os.path.getsize(dest)
+            or os.path.getmtime(current) > os.path.getmtime(dest) + 1
+        )
+        if needs_copy:
+            shutil.copy2(current, dest)
+        copy_runtime_sidecars(current_dir, dest_dir)
+    except OSError:
+        return False
+    retarget_shortcuts(dest)
+    # Exit first. Launching the copy while this onefile process is alive
+    # deletes the temp folder the new process still needs.
+    pid = os.getpid()
+    ps = (
+        f"$p={pid};"
+        f"$deadline=(Get-Date).AddSeconds(30);"
+        f"while((Get-Date) -lt $deadline -and (Get-Process -Id $p -EA SilentlyContinue))"
+        f"{{Start-Sleep -m 200}};"
+        f"Start-Sleep -m 2000;"
+        f"Start-Process -FilePath '{dest.replace(chr(39), chr(39)+chr(39))}' "
+        f"-WorkingDirectory '{dest_dir.replace(chr(39), chr(39)+chr(39))}'"
+    )
+    try:
+        flags = subprocess.CREATE_NO_WINDOW
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+            close_fds=True,
+            creationflags=flags,
+        )
+    except OSError:
+        return False
+    release_app_mutex()
+    os._exit(0)
+
+
 def main():
     _enable_dpi_awareness()
+    if relocate_unwritable_install():
+        return
     _create_app_mutex()
     _cleanup_old_update()
     if _DND_AVAILABLE:
