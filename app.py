@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 HISTORY_MAX = 100
@@ -82,6 +82,21 @@ HISTORY_MAX = 100
 DISCORD_CLIENT_ID = os.environ.get("TMRIPPER_DISCORD_ID", "1522693674503241968")
 DISCORD_LARGE_IMAGE = "tm_logo"
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+
+# Public tallies across every install. A request is only "add one" or
+# "what is the number" — the video link is not sent.
+# https://abacus.jasoncameron.dev
+#
+# Later, if the totals need to be harder to inflate: put a small HTTPS
+# service on a VPS in front of these counters. The app would call only that
+# server. New counter names and the admin keys would live on the VPS, never
+# in this repo, and the server would allow only a few counts per address per
+# hour. The tm-ripper/downloads and tm-ripper/conversions keys below would
+# be retired, because they are visible in source and can be incremented
+# directly.
+STATS_NAMESPACE = "tm-ripper"
+STATS_KEYS = ("downloads", "conversions")
+STATS_REFRESH_MS = 5000
 
 if getattr(sys, "frozen", False):
     # Running as a PyInstaller .exe.
@@ -222,6 +237,31 @@ def save_settings(data: dict) -> None:
         pass
 
 
+def fetch_global_stat(key: str, increment: bool = False) -> int | None:
+    """Read or add one to a shared counter. None if it can't be reached."""
+    action = "hit" if increment else "get"
+    url = f"https://abacus.jasoncameron.dev/{action}/{STATS_NAMESPACE}/{key}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": f"TMRipper/{APP_VERSION}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.load(resp)
+        value = data.get("value")
+        return int(value) if value is not None else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def saved_file(path: str | None) -> bool:
+    """True when path is a real, non-empty file on disk."""
+    try:
+        return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
 def load_history() -> list:
     try:
         with open(HISTORY_PATH, "r", encoding="utf-8") as fh:
@@ -325,6 +365,22 @@ def detect_platform(url: str) -> str:
     if "youtube.com" in u or "youtu.be" in u:
         return "YouTube"
     return "Unknown"
+
+
+# TikTok answers yt-dlp's default Chrome client with a tiny non-video page,
+# which the extractor reports as "Unexpected response from webpage request".
+# A Firefox user agent gets the real page (and the JS challenge, when sent).
+TIKTOK_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) "
+    "Gecko/20100101 Firefox/140.0"
+)
+
+
+def ydl_site_opts(url: str) -> dict:
+    """Extra YoutubeDL options required for a specific site."""
+    if detect_platform(url) == "TikTok":
+        return {"http_headers": {"User-Agent": TIKTOK_USER_AGENT}}
+    return {}
 
 
 def human_size(num) -> str:
@@ -692,12 +748,15 @@ class DownloaderApp:
         self.folder_var = tk.StringVar(value=saved_folder)
         self.quality_var = tk.StringVar(value=settings.get("quality", "Best video + audio"))
         self.status_var = tk.StringVar(value="Ready.")
+        self.stats_vars = {key: tk.StringVar(value="\u2026") for key in STATS_KEYS}
+        self._stats_values = {key: None for key in STATS_KEYS}
         self.sound_var = tk.BooleanVar(value=bool(settings.get("sound", True)))
         self.url_var.trace_add("write", self._on_url_change)
         # Persist folder/quality/sound the moment they change so settings never get lost.
         self.folder_var.trace_add("write", lambda *_: self._persist())
         self.quality_var.trace_add("write", lambda *_: self._persist())
         self.sound_var.trace_add("write", lambda *_: self._persist())
+        self._stats_lock = threading.Lock()
 
         self.log_history: list[tuple[str, bool]] = []
         self.download_history: list = load_history()
@@ -845,13 +904,102 @@ class DownloaderApp:
         return bar
 
     def _about(self):
-        self._alert(
-            "About " + APP_TITLE,
-            APP_TITLE + " by TheMannster\n\nDownloads TikTok, Instagram Reels, Facebook Reels, "
-            "and YouTube Shorts.\nConvert downloads (or any media file) to other formats.\n\n"
-            "Powered by yt-dlp + ffmpeg.",
-            kind="info",
-        )
+        pal = self._dialog_palette()
+        retro = self.theme == THEME_RETRO
+        win = tk.Toplevel(self.root)
+        win.title("About " + APP_TITLE)
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.configure(bg=pal["bg"])
+        self._play_sound("info")
+
+        pad = tk.Frame(win, bg=pal["bg"])
+        pad.pack(fill="both", expand=True, padx=20, pady=18)
+        tk.Label(pad, text=APP_TITLE + " by TheMannster", bg=pal["bg"], fg=pal["fg"],
+                 font=pal["title"], anchor="w").pack(anchor="w")
+        tk.Label(pad, text=f"Version {APP_VERSION}", bg=pal["bg"], fg=pal["sub"],
+                 font=pal["font"], anchor="w").pack(anchor="w", pady=(2, 0))
+        tk.Label(
+            pad,
+            text="Downloads TikTok, Instagram Reels, Facebook Reels, and YouTube Shorts.\n"
+                 "Convert downloads (or any media file) to other formats.",
+            bg=pal["bg"], fg=pal["sub"], font=pal["font"],
+            justify="left", anchor="w", wraplength=380,
+        ).pack(anchor="w", pady=(12, 14))
+
+        box = tk.Frame(pad, bg=pal["surface"], highlightbackground=pal["border"], highlightthickness=1)
+        box.pack(fill="x", pady=(0, 16))
+        inner = tk.Frame(box, bg=pal["surface"])
+        inner.pack(fill="x", padx=14, pady=12)
+        caption_font = WIN95_FONT if retro else UI_FONT_SM
+        number_font = ("Segoe UI Semibold", 22) if not retro else WIN95_FONT_BOLD
+        cols = tk.Frame(inner, bg=pal["surface"])
+        cols.pack(fill="x")
+        for index, (key, label) in enumerate((
+            ("downloads", "Worldwide downloads"),
+            ("conversions", "File conversions"),
+        )):
+            col = tk.Frame(cols, bg=pal["surface"])
+            col.pack(side="left", fill="x", expand=True, padx=(0 if index == 0 else 16, 0))
+            tk.Label(col, text=label, bg=pal["surface"], fg=pal["sub"],
+                     font=caption_font, anchor="w").pack(anchor="w")
+            tk.Label(col, textvariable=self.stats_vars[key], bg=pal["surface"], fg=pal["fg"],
+                     font=number_font, anchor="w").pack(anchor="w", pady=(2, 0))
+        tk.Label(
+            inner, text="Successful saves only.",
+            bg=pal["surface"], fg=pal["sub"], font=caption_font, anchor="w",
+        ).pack(anchor="w", pady=(8, 0))
+
+        row = tk.Frame(pad, bg=pal["bg"])
+        row.pack(fill="x")
+        tk.Label(row, text="Powered by yt-dlp + ffmpeg.", bg=pal["bg"], fg=pal["sub"],
+                 font=caption_font, anchor="w").pack(side="left")
+        if retro:
+            make_button(row, "OK", win.destroy, width=9).pack(side="right")
+        else:
+            mk_button(row, "OK", win.destroy, kind="accent").pack(side="right")
+
+        self._refresh_global_stats(increment=False)
+
+        def tick():
+            if not win.winfo_exists():
+                return
+            self._refresh_global_stats(increment=False)
+            win.after(STATS_REFRESH_MS, tick)
+
+        win.after(STATS_REFRESH_MS, tick)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.update_idletasks()
+        set_dark_titlebar(win, pal["dark"])
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
+        win.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+        win.grab_set()
+        win.wait_window()
+
+    def _count_if_saved(self, key: str, path: str | None):
+        """Add one to a worldwide tally only when a real file was written."""
+        if saved_file(path):
+            self._refresh_global_stats(key, increment=True)
+
+    def _refresh_global_stats(self, key: str | None = None, increment: bool = False):
+        threading.Thread(
+            target=self._stats_worker, args=(key, increment), daemon=True,
+        ).start()
+
+    def _stats_worker(self, key: str | None, increment: bool):
+        if increment:
+            self._stats_lock.acquire()
+        elif not self._stats_lock.acquire(blocking=False):
+            return
+        try:
+            keys = (key,) if key else STATS_KEYS
+            for stat_key in keys:
+                value = fetch_global_stat(stat_key, increment=increment and stat_key == key)
+                self.msg_queue.put(("stats", stat_key, value))
+        finally:
+            self._stats_lock.release()
 
     # -------------------------------------------------- Notifications
     def _dialog_palette(self):
@@ -1802,6 +1950,7 @@ class DownloaderApp:
     def _preview_worker(self, url: str):
         try:
             opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+            opts.update(ydl_site_opts(url))
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             meta = {
@@ -1919,6 +2068,7 @@ class DownloaderApp:
             "no_warnings": True,
             "restrictfilenames": False,
         }
+        ydl_opts.update(ydl_site_opts(url))
         if FFMPEG_DIR:
             ydl_opts["ffmpeg_location"] = FFMPEG_DIR
         if audio_only:
@@ -2226,6 +2376,7 @@ class DownloaderApp:
                     self.status_var.set("Done!")
                     self._log(f"Saved: {title}")
                     self._record_history(title, filepath, url=url, quality=quality)
+                    self._count_if_saved("downloads", filepath)
                     self._finish()
                     self._notify(f"Download complete!\n{title}", "success")
                 elif kind == "cancelled":
@@ -2247,6 +2398,7 @@ class DownloaderApp:
                     self.status_var.set("Conversion done!")
                     self._log(f"Converted ({fmt_label}): {title}")
                     self._record_history(title, filepath, quality=f"Converted → {fmt_label}")
+                    self._count_if_saved("conversions", filepath)
                     self._update_action_buttons()
                     self.discord.set_idle()
                     self._notify(f"Converted!\n{title}", "success")
@@ -2273,6 +2425,17 @@ class DownloaderApp:
                     self._log("Preview failed: " + err, error=True)
                     self._update_action_buttons()
                     self.discord.set_idle()
+                elif kind == "stats":
+                    _, key, value = msg
+                    label = self.stats_vars.get(key)
+                    if label is None:
+                        continue
+                    if value is None:
+                        if self._stats_values.get(key) is None:
+                            label.set("unavailable")
+                    else:
+                        self._stats_values[key] = value
+                        label.set(f"{value:,}")
                 elif kind == "update_done":
                     _, ok, summary = msg
                     self.is_busy = False
