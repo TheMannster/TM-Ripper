@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover
 
 
 APP_TITLE = "TM Ripper"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.7"
 GITHUB_REPO = "TheMannster/TM-Ripper"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 HISTORY_MAX = 100
@@ -2225,7 +2225,7 @@ class DownloaderApp:
                 os.rename(staging, target)
             else:
                 os.replace(staging, target)
-                retarget_shortcuts(target)
+            retarget_shortcuts(target)
         except OSError as exc:
             for leftover in (staging,):
                 try:
@@ -2278,8 +2278,8 @@ class DownloaderApp:
 
         pid = os.getpid()
         arg_list = args or []
-        arg_ps = ",".join(self._ps_quote(a) for a in arg_list)
-        start_args = f"-ArgumentList @({arg_ps}) " if arg_ps else ""
+        workdir = os.path.dirname(target) or "."
+        cmd_line = '/c start "" "' + target + '"' + "".join(" " + a for a in arg_list)
         kill_ps = (
             "Get-Process -Name 'TM Ripper' -EA SilentlyContinue | "
             "Stop-Process -Force -EA SilentlyContinue; Start-Sleep -m 300; "
@@ -2297,8 +2297,10 @@ class DownloaderApp:
             f"{{Start-Sleep -m 200}};"
             f"Start-Sleep -m {int(settle_ms)};"
             f"{kill_ps}"
-            f"Start-Process -FilePath {self._ps_quote(target)} {start_args}"
-            f"-WorkingDirectory {self._ps_quote(os.path.dirname(target) or '.')}"
+            f"{PYINSTALLER_ENV_CLEAR}"
+            f"Start-Process -FilePath 'cmd.exe' -WindowStyle Hidden "
+            f"-WorkingDirectory {self._ps_quote(workdir)} "
+            f"-ArgumentList {self._ps_quote(cmd_line)}"
         )
         try:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -2306,6 +2308,7 @@ class DownloaderApp:
                 ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
                 close_fds=True,
                 creationflags=flags,
+                env=pyinstaller_clean_env(),
             )
         except Exception as exc:  # noqa: BLE001
             self._alert(APP_TITLE, f"Could not schedule relaunch:\n{exc}", kind="error")
@@ -2561,6 +2564,31 @@ def _cleanup_old_update():
             pass
 
 
+# A restarted onefile build inherits these and treats the dying temp folder
+# as its own. python314.dll is then deleted before it can load.
+_PYINSTALLER_ENV_KEYS = (
+    "_MEIPASS",
+    "_MEIPASS2",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_ARCHIVE_FILE",
+    "_PYI_PARENT_PROCESS_LEVEL",
+)
+PYINSTALLER_ENV_CLEAR = (
+    "$env:PYINSTALLER_RESET_ENVIRONMENT='1';"
+    "foreach($n in '_MEIPASS','_MEIPASS2','_PYI_APPLICATION_HOME_DIR',"
+    "'_PYI_ARCHIVE_FILE','_PYI_PARENT_PROCESS_LEVEL'){"
+    "Remove-Item \"Env:$n\" -EA SilentlyContinue};"
+)
+
+
+def pyinstaller_clean_env() -> dict:
+    env = os.environ.copy()
+    for key in _PYINSTALLER_ENV_KEYS:
+        env.pop(key, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def user_install_dir() -> str:
     """A per-user folder the app can replace itself in, without admin."""
     local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
@@ -2634,7 +2662,12 @@ def retarget_shortcuts(new_exe: str):
         "      }"
         "    } catch {}"
         "  }"
-        "}"
+        "};"
+        "$menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'TM Ripper';"
+        "New-Item -ItemType Directory -Force -Path $menu | Out-Null;"
+        "$userLnk = Join-Path $menu 'TM Ripper.lnk';"
+        "$mine = $shell.CreateShortcut($userLnk);"
+        "$mine.TargetPath = $new; $mine.WorkingDirectory = $dir; $mine.Save()"
     )
     try:
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -2662,10 +2695,9 @@ def relocate_unwritable_install() -> bool:
         return False
     dest = os.path.join(dest_dir, "TM Ripper.exe")
     try:
-        needs_copy = (
-            not os.path.isfile(dest)
-            or os.path.getsize(current) != os.path.getsize(dest)
-            or os.path.getmtime(current) > os.path.getmtime(dest) + 1
+        # Never copy an older Program Files build over a newer in-app update.
+        needs_copy = not os.path.isfile(dest) or (
+            os.path.getmtime(current) > os.path.getmtime(dest) + 1
         )
         if needs_copy:
             shutil.copy2(current, dest)
@@ -2682,8 +2714,10 @@ def relocate_unwritable_install() -> bool:
         f"while((Get-Date) -lt $deadline -and (Get-Process -Id $p -EA SilentlyContinue))"
         f"{{Start-Sleep -m 200}};"
         f"Start-Sleep -m 2000;"
-        f"Start-Process -FilePath '{dest.replace(chr(39), chr(39)+chr(39))}' "
-        f"-WorkingDirectory '{dest_dir.replace(chr(39), chr(39)+chr(39))}'"
+        f"{PYINSTALLER_ENV_CLEAR}"
+        f"Start-Process -FilePath 'cmd.exe' -WindowStyle Hidden "
+        f"-WorkingDirectory '{dest_dir.replace(chr(39), chr(39)+chr(39))}' "
+        f"-ArgumentList '/c start \"\" \"{dest.replace(chr(39), chr(39)+chr(39))}\"'"
     )
     try:
         flags = subprocess.CREATE_NO_WINDOW
@@ -2691,6 +2725,7 @@ def relocate_unwritable_install() -> bool:
             ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
             close_fds=True,
             creationflags=flags,
+            env=pyinstaller_clean_env(),
         )
     except OSError:
         return False
