@@ -5,7 +5,7 @@
 ; Compile with:  ISCC installer.iss   (or run build_installer.bat)
 
 #define MyAppName "TM Ripper"
-#define MyAppVersion "1.2.7"
+#define MyAppVersion "1.2.8"
 #define MyAppPublisher "TheMannster"
 #define MyAppExeName "TM Ripper.exe"
 
